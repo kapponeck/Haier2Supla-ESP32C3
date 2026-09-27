@@ -1,88 +1,85 @@
 # Haier2Supla ESP32-C3 0.9.0
 
-Moja wersja projektu [piglet0/haier2supla](https://github.com/piglet0/haier2supla).
-Dodałem obsługę klimatyzatorów z protokołem hOn i przygotowałem firmware dla
-Tenstar ROBOT ESP32-C3 Super Mini 4 MB.
+My version of the [piglet0/haier2supla](https://github.com/piglet0/haier2supla)
+project. It adds support for air conditioners using the hOn protocol and
+provides ready-to-use firmware for the Tenstar ROBOT ESP32-C3 Super Mini 4 MB.
 
-Repozytorium: https://github.com/kapponeck/Haier2Supla-ESP32C3
+## Features
 
-## Co działa
+- automatic SmartAir2 or hOn protocol detection;
+- room temperature and full AC status reading;
+- power control;
+- Heat, Cool and Auto modes through the HVAC channel;
+- separate Dry and Fan Only controls;
+- target temperature control from SUPLA;
+- one fan-speed slider: Auto, Low, Mid and High;
+- separate horizontal and vertical swing controls;
+- Health, Quiet, Turbo, display, energy-saving and 10°C modes;
+- SUPLA status updates after using the original remote control;
+- Wi-Fi, pin and interface-level configuration through the web interface;
+- firmware updates through the web interface.
 
-- automatyczne wykrywanie SmartAir2 lub hOn;
-- odczyt temperatury i stanu klimatyzatora;
-- włączanie i wyłączanie;
-- tryby Heat, Cool i Auto w kanale HVAC;
-- osobne sterowanie Dry i Fan Only;
-- zadawanie temperatury z SUPLA;
-- jeden suwak wentylatora: Auto, Low, Mid i High;
-- osobny swing poziomy i pionowy;
-- Health, Quiet, Turbo, wyświetlacz, oszczędzanie energii i tryb 10°C;
-- aktualizacja stanu SUPLA po użyciu oryginalnego pilota;
-- konfiguracja Wi-Fi, pinów i poziomu interfejsu przez WWW;
-- aktualizacja firmware przez WWW.
+The first valid state received from the air conditioner takes priority over
+the default SUPLA state. This prevents the device from sending unintended
+settings to the AC during startup.
 
-Pierwszy prawidłowy stan odczytany z klimatyzatora ma pierwszeństwo przed
-domyślnym stanem SUPLA. Dzięki temu urządzenie po starcie nie wysyła od razu
-przypadkowych ustawień do klimatyzatora.
+## Changes from the piglet0 version
 
-## Zmiany względem wersji piglet0
+- hOn support with CRC and device-ID initialization;
+- automatic SmartAir2/hOn detection;
+- default configuration for the ESP32-C3 Super Mini;
+- simplified controls: HVAC, Dry, Fan Only and one fan-speed slider;
+- improved synchronization after changes from SUPLA or the remote control;
+- protection against an older status frame reverting a newly sent command;
+- USB logging no longer blocks the ESP32-C3 when no terminal is connected.
 
-- obsługa hOn z CRC i odczytem identyfikatora urządzenia;
-- automatyczne rozpoznawanie hOn/SmartAir2;
-- domyślna konfiguracja dla ESP32-C3 Super Mini;
-- uproszczone sterowanie: HVAC + Dry + Fan Only + jeden suwak wentylatora;
-- poprawiona synchronizacja po sterowaniu z SUPLA i pilota;
-- zabezpieczenie przed cofnięciem świeżo wysłanej komendy przez starszą ramkę;
-- logowanie USB nie blokuje pracy urządzenia, gdy terminal nie jest otwarty.
+## SUPLA controls
 
-## Sterowanie w SUPLA
+The `Minimal` interface level contains HVAC, temperature and humidity, Dry,
+Fan Only, the fan-speed slider and both swing controls.
 
-Poziom `Minimal` zawiera HVAC, temperaturę i wilgotność, Dry, Fan Only, suwak
-wentylatora oraz oba kierunki swing.
+The `Standard` level adds Health, Power Saving, Quiet and display control.
 
-Poziom `Standard` dodaje Health, Power Saving, Quiet i sterowanie wyświetlaczem.
+The `Debug` level adds Turbo, 10°C mode and detailed AC status channels.
 
-Poziom `Debug` dodaje Turbo, tryb 10°C i kanały pokazujące szczegółowy stan
-klimatyzatora.
+Changing the interface level changes the number of SUPLA channels. The device
+may need to be removed from SUPLA Cloud and registered again after this change.
 
-Zmiana poziomu interfejsu zmienia liczbę kanałów. Po zmianie może być potrzebne
-usunięcie urządzenia z SUPLA Cloud i ponowna rejestracja.
+Auto mode also sets the fan to Auto. Fan Only does not use Auto fan speed, so
+the firmware selects Low instead. The display-temperature toggle sequence is
+not supported with the hOn protocol.
 
-W trybie Auto wentylator przechodzi na Auto. W trybie Fan Only prędkość Auto
-nie jest używana — firmware wybiera Low. Funkcja przełączania temperatury
-wyświetlanej na panelu nie jest obsługiwana przez hOn.
+## Board and default pins
 
-## Płytka i piny
-
-- płytka: Tenstar ROBOT ESP32-C3 Super Mini, flash 4 MB;
+- board: Tenstar ROBOT ESP32-C3 Super Mini, 4 MB flash;
 - UART RX: GPIO20;
 - UART TX: GPIO21;
-- LED: GPIO8, aktywna stanem niskim;
-- BOOT/konfiguracja: GPIO9;
-- USB CDC przy starcie: włączone.
+- status LED: GPIO8, active low;
+- BOOT/configuration button: GPIO9;
+- USB CDC on boot: enabled.
 
-Piny można zmienić w konfiguracji WWW. GPIO ESP32-C3 pracują z logiką 3,3 V
-i nie są odporne na 5 V. ESP zastępuje oryginalny moduł Wi-Fi klimatyzatora.
+The pins can be changed in the web configuration. ESP32-C3 GPIO uses 3.3 V
+logic and is not 5 V tolerant. The ESP32 replaces the original AC Wi-Fi dongle.
 
-## Gotowe pliki BIN
+## Ready-to-use firmware
 
-Pliki są w katalogu `firmware`:
+The compiled files are available in the `firmware` directory:
 
-- `*-factory.bin` — pierwsze wgranie pod adres `0x0`;
-- `*-app.bin` — aktualizacja przez stronę WWW albo po kablu pod adres `0x10000`.
+- `*-factory.bin` — complete image for the first installation at address `0x0`;
+- `*-app.bin` — web update image, or cable upload at address `0x10000`.
 
-Nie wgrywaj `app.bin` do pustej płytki. Sumy kontrolne są w
+Do not upload `app.bin` to an empty board. Checksums are available in
 `SHA256SUMS.txt`.
 
 ## Arduino IDE
 
-1. Zainstaluj obsługę ESP32 w wersji 3.3.11.
-2. Skopiuj katalogi `Haier2Supla`, `HaierProtocol` i `SuplaDevice` do katalogu
-   bibliotek Arduino.
-3. Otwórz `Haier2Supla/examples/Haier2Supla/Haier2Supla.ino`.
-4. Wybierz `ESP32C3 Dev Module`, flash 4 MB, `USB CDC On Boot: Enabled` oraz
-   partycję `Minimal SPIFFS (1.9MB APP with OTA)`.
-5. Skompiluj i wgraj szkic.
+1. Install ESP32 board support version 3.3.11.
+2. Copy the `Haier2Supla`, `HaierProtocol` and `SuplaDevice` directories to
+   your Arduino libraries directory.
+3. Open `Haier2Supla/examples/Haier2Supla/Haier2Supla.ino`.
+4. Select `ESP32C3 Dev Module`, 4 MB flash, `USB CDC On Boot: Enabled` and
+   `Minimal SPIFFS (1.9MB APP with OTA)`.
+5. Compile and upload the sketch.
 
 ## PlatformIO
 
@@ -90,21 +87,22 @@ Nie wgrywaj `app.bin` do pustej płytki. Sumy kontrolne są w
 python -m platformio run -e esp32-c3-super-mini
 ```
 
-## Testy
+## Verification
 
-Kompilacja `0.9.0` zakończyła się poprawnie. hOn był sprawdzony na
-Haier Tundra Plus AS35TADHRA-CL: wykrywanie protokołu, CRC, temperatura, stan,
-sterowanie i rejestracja w SUPLA działają.
+Version `0.9.0` compiles successfully. hOn was tested with a Haier Tundra Plus
+AS35TADHRA-CL. Protocol detection, CRC, temperature, status reading, control
+and SUPLA registration are working.
 
-SmartAir2 pozostał w kodzie, ale tej wersji nie sprawdzałem ponownie na
-fizycznym urządzeniu SmartAir2.
+SmartAir2 remains supported in the code, but this version has not been tested
+again on a physical SmartAir2 unit.
 
-## Autorzy i licencje
+## Credits and licenses
 
-Projekt bazowy: [piglet0/haier2supla](https://github.com/piglet0/haier2supla).
-Komunikacja Haier korzysta z projektu
-[paveldn/HaierProtocol](https://github.com/paveldn/HaierProtocol), a obsługa
-SUPLA z [SUPLA/supla-device](https://github.com/SUPLA/supla-device).
+Original project: [piglet0/haier2supla](https://github.com/piglet0/haier2supla).
+Haier communication uses
+[paveldn/HaierProtocol](https://github.com/paveldn/HaierProtocol), while SUPLA
+support is provided by
+[SUPLA/supla-device](https://github.com/SUPLA/supla-device).
 
-Licencja głównego projektu: GPL-3.0. Licencje zależności znajdują się w ich
-katalogach.
+The main project is licensed under GPL-3.0. Dependency licenses are included
+in their respective directories.
