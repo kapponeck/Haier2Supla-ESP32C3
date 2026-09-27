@@ -1,0 +1,87 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "sw_update_mock.h"
+
+#include <SuplaDevice.h>
+#include <supla/device/sw_update.h>
+#include <cstdio>
+
+SwUpdateMock *SwUpdateMock::instance = nullptr;
+
+class SwUpdateFacade : public Supla::Device::SwUpdate {
+ public:
+  explicit SwUpdateFacade(SwUpdateMock *mock)
+      : Supla::Device::SwUpdate(nullptr, nullptr, Supla::SwUpdateMode::NotSet),
+        mock(mock) {
+  }
+
+  void iterate() override {
+    mock->iterate();
+  }
+
+  void setFinished() {
+    finished = true;
+  }
+
+  void setAborted() {
+    abort = true;
+  }
+
+  void setRetryAllowed() {
+    retryAllowed = true;
+  }
+
+  void setNewVersion(const char *version) {
+    if (newVersion) {
+      delete[] newVersion;
+      newVersion = nullptr;
+    }
+    newVersion = new char[strlen(version) + 1];
+    snprintf(newVersion, strlen(version) + 1, "%s", version);
+  }
+
+  bool isSkipCert() const {
+    return skipCert;
+  }
+
+  SwUpdateMock *mock;
+};
+
+Supla::Device::SwUpdate *Supla::Device::SwUpdate::Create(SuplaDeviceClass *,
+                                                         const char *,
+                                                         Supla::SwUpdateMode) {
+  assert(SwUpdateMock::instance != nullptr);
+  auto facade = new SwUpdateFacade(SwUpdateMock::instance);
+  SwUpdateMock::instance->setFacade(facade);
+  return facade;
+}
+
+SwUpdateMock::SwUpdateMock()
+    : Supla::Device::SwUpdate(nullptr, nullptr, Supla::SwUpdateMode::NotSet) {
+  instance = this;
+}
+
+void SwUpdateMock::setFinished() {
+  facade->setFinished();
+}
+
+void SwUpdateMock::setAborted() {
+  facade->setAborted();
+}
+
+void SwUpdateMock::setRetryAllowed() {
+  facade->setRetryAllowed();
+}
+
+void SwUpdateMock::setNewVersion(const char *version) {
+  facade->setNewVersion(version);
+}
+
+bool SwUpdateMock::isSecurityOnlyOnFacade() {
+  return facade->isSecurityOnly();
+}
+
+bool SwUpdateMock::isSkipCertOnFacade() {
+  return facade->isSkipCert();
+}

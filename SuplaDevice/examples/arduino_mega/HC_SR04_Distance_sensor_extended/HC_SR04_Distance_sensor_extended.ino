@@ -1,0 +1,85 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/**
+ * @supla-example
+ * @file HC_SR04_Distance_sensor_extended.ino
+ * @brief Extended example of an HC-SR04 ultrasonic distance sensor with custom mapping for display in SUPLA, using an Arduino Mega.
+ * This example demonstrates how to connect an HC-SR04 ultrasonic sensor to an Arduino Mega
+ * and integrate its distance readings with the SUPLA cloud via an Ethernet shield (W5100 or ENC28J60).
+ * Users need to adjust network settings, SUPLA GUID, AUTHKEY, and GPIO pins for the sensor, as well as the distance mapping parameters in the code.
+ *
+ * @tags HC-SR04, ultrasonic, distance, sensor, extended, mapping, arduino_mega, ethernet, w5100, enc28j60
+ */
+#include <SuplaDevice.h>
+
+// Add include to HC_SR04 sensor
+#include <supla/sensor/HC_SR04.h>
+
+// Choose proper network interface for your card:
+// Arduino Mega with EthernetShield W5100:
+#include <supla/network/ethernet_shield.h>
+// Ethernet MAC address
+uint8_t mac[6] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
+Supla::EthernetShield ethernet(mac);
+
+// Arduino Mega with ENC28J60:
+// #include <supla/network/ENC28J60.h>
+// Supla::ENC28J60 ethernet(mac);
+
+int8_t trigPin = 13;
+int8_t echoPin = 12;
+int16_t minSensorRead = 5;   // minimum sensor reading distance in centimeters
+int16_t maxSensorRead = 55;  // maximum sensor reading distance in centimeters
+int16_t minAppReading = 50;  // minimum distance shown by the App in centimeters
+                             // when sensor read <= min_sensor_read
+int16_t maxAppReading = 0;   // maximum distance shown by the App in centimeters
+                             // when sensor read >= max_sensor_read
+
+void setup() {
+  Serial.begin(115200);
+
+  // Replace the falowing GUID with value that you can retrieve from
+  // https://www.supla.org/arduino/get-guid
+  char GUID[SUPLA_GUID_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+  // Replace the following AUTHKEY with value that you can retrieve from:
+  // https://www.supla.org/arduino/get-authkey
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00};
+
+  /*
+   * Having your device already registered at cloud.supla.org,
+   * you want to change CHANNEL sequence or remove any of them,
+   * then you must also remove the device itself from cloud.supla.org.
+   * Otherwise you will get "Channel conflict!" error.
+   */
+
+  new Supla::Sensor::HC_SR04(trigPin,
+                             echoPin,
+                             minSensorRead,
+                             maxSensorRead,
+                             minAppReading,
+                             maxAppReading);
+
+  /*
+   * SuplaDevice Initialization.
+   * Server address is available at https://cloud.supla.org
+   * If you do not have an account, you can create it at
+   * https://cloud.supla.org/account/create SUPLA and SUPLA CLOUD are free of
+   * charge
+   *
+   */
+
+  SuplaDevice.begin(
+      GUID,              // Global Unique Identifier
+      "svrX.supla.org",  // SUPLA server address
+      "email@address",   // Email address used to login to Supla Cloud
+      AUTHKEY);          // Authorization key
+}
+
+void loop() {
+  SuplaDevice.iterate();
+}

@@ -1,0 +1,116 @@
+// SPDX-FileCopyrightText: lukfud
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/**
+ * @supla-example
+ * @file KC868-A16.ino
+ * @brief Example for KinCony KC868-A16 device with 16 relays and 16 inputs, using PCF8574 expanders for SUPLA integration.
+ * This example demonstrates how to configure and control the KC868-A16 ESP32-based relay board.
+ * It initializes 16 relays and 16 corresponding buttons/action triggers, leveraging PCF8574 I2C expanders for I/O.
+ * The device integrates with the SUPLA cloud via Wi-Fi or Ethernet (ESP32-ETH) and includes a web server for configuration.
+ * Network settings are configured via the web interface.
+ * Users need to adjust I2C GPIOs for PCF8574 expanders in the code. It also includes a factory reset option.
+ *
+ * @dependency https://www.kincony.com/esp32-board-16-channel-relay-hardware.html
+ * @tags KC868-A16, KinCony, ESP32, PCF8574, relay, button, action_trigger, I2C, expander, ethernet, wifi, SUPLA-A16, web_interface
+ */
+
+constexpr uint8_t SDA_ = 4;
+constexpr uint8_t SCL_ = 5;
+constexpr uint8_t CFG_BTN_GPIO = 14;  // GPIO termianl T3
+constexpr uint8_t MAX_CHANNELS = 16;
+
+#include <SuplaDevice.h>
+
+#include <supla/network/esp_wifi.h>
+Supla::ESPWifi *wifi = nullptr;
+#include <supla/network/esp32eth.h>
+Supla::ESPETH *eth = nullptr;
+
+#include <supla/storage/eeprom.h>
+Supla::Eeprom eeprom;
+#include <supla/storage/littlefs_config.h>
+Supla::LittleFsConfig configSupla(4096);
+
+#include <supla/network/esp_web_server.h>
+Supla::EspWebServer suplaServer;
+
+#include <supla/io/PCF8574.h>
+Supla::Io::PCF8574 *inPcf[2] = {};
+Supla::Io::PCF8574 *outPcf[2] = {};
+
+#include <supla/control/button.h>
+Supla::Control::Button *button[MAX_CHANNELS] = {};
+
+#include <supla/control/action_trigger.h>
+Supla::Control::ActionTrigger *at[MAX_CHANNELS] = {};
+
+#include <supla/control/relay.h>
+Supla::Control::Relay *relay[MAX_CHANNELS] = {};
+
+#include <supla/network/html/device_info.h>
+#include <supla/network/html/protocol_parameters.h>
+#include <supla/network/html/wifi_parameters.h>
+#include <supla/network/html/ethernet_parameters.h>
+#include <supla/network/html/text_cmd_input_parameter.h>
+
+void setup() {
+  Serial.begin(115'200);
+  Wire.begin(SDA_, SCL_, 400'000);
+
+  wifi = new Supla::ESPWifi;
+  eth = new Supla::ESPETH(0);
+
+  auto cfgButton = new Supla::Control::Button(CFG_BTN_GPIO, true, true);
+  cfgButton->configureAsConfigButton(&SuplaDevice);
+
+  for (int i = 0; i < 2; i++) {
+    inPcf[i] = new Supla::Io::PCF8574(0x22 - i);
+    outPcf[i] = new Supla::Io::PCF8574(0x24 + i);
+  }
+
+  constexpr uint8_t GPIO[] = {
+    0, 1, 2, 3, 4, 5, 6, 7,
+    0, 1, 2, 3, 4, 5, 6, 7
+  };
+
+  for (int i = 0; i < MAX_CHANNELS; i++) {
+    uint8_t pcfIndex = (i < MAX_CHANNELS / 2) ? 0 : 1;
+    relay[i] = new Supla::Control::Relay(outPcf[pcfIndex], GPIO[i], false, 224);
+    relay[i]->getChannel()->setDefault(SUPLA_CHANNELFNC_LIGHTSWITCH);
+    char buff[15];
+    snprintf(buff, sizeof(buff), "RELAY - %02d", i + 1);
+    relay[i]->setInitialCaption(buff);
+    relay[i]->getChannel()->setChannelNumber((i * 2) + 1 + 10);
+    relay[i]->disableChannelState();
+    relay[i]->setDefaultStateRestore();
+    button[i] = new Supla::Control::Button(
+                                          inPcf[pcfIndex], GPIO[i], true, true);
+    button[i]->setHoldTime(400);
+    button[i]->setMulticlickTime(350);
+    button[i]->addAction(Supla::TOGGLE, relay[i], Supla::ON_CLICK_1);
+    at[i] = new Supla::Control::ActionTrigger();
+    at[i]->getChannel()->setChannelNumber((i * 2) + 2 + 10);
+    at[i]->setRelatedChannel(relay[i]);
+    at[i]->attach(button[i]);
+  }
+
+  new Supla::Html::DeviceInfo(&SuplaDevice);
+  new Supla::Html::WifiParameters;
+  new Supla::Html::EthernetParameters;
+  new Supla::Html::ProtocolParameters(false, false);
+  auto textCmd = new Supla::Html::TextCmdInputParameter(
+                                                    "cmd1", "Reset to factory");
+  textCmd->registerCmd("RESET", Supla::ON_EVENT_1);
+  textCmd->addAction(Supla::RESET_TO_FACTORY_SETTINGS,
+                                                SuplaDevice, Supla::ON_EVENT_1);
+
+  SuplaDevice.setInitialMode(Supla::InitialMode::StartWithCfgModeThenOffline);
+  SuplaDevice.setCustomHostnamePrefix("SUPLA-A16");
+  SuplaDevice.setName("KC868-A16");
+  SuplaDevice.begin();
+}
+
+void loop() {
+  SuplaDevice.iterate();
+}

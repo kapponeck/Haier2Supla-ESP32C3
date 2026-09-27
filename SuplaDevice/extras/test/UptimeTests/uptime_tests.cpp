@@ -1,0 +1,87 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <gtest/gtest.h>
+#include <supla/uptime.h>
+#include <supla-common/proto.h>
+
+TEST(UptimeTests, LastResetCauseSetAndGet) {
+  Supla::Uptime uptime;
+  EXPECT_EQ(uptime.getUptime(), 0);
+  EXPECT_EQ(uptime.getConnectionUptime(), 0);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+
+  // setter should not work unless first resetConnectionUptime is called
+  uptime.setConnectionLostCause(
+      SUPLA_LASTCONNECTIONRESETCAUSE_WIFI_CONNECTION_LOST);
+  EXPECT_EQ(uptime.getUptime(), 0);
+  EXPECT_EQ(uptime.getConnectionUptime(), 0);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+
+  uptime.resetConnectionUptime();
+  uptime.setConnectionLostCause(
+      SUPLA_LASTCONNECTIONRESETCAUSE_WIFI_CONNECTION_LOST);
+  EXPECT_EQ(uptime.getUptime(), 0);
+  EXPECT_EQ(uptime.getConnectionUptime(), 0);
+  EXPECT_EQ(uptime.getLastResetCause(),
+            SUPLA_LASTCONNECTIONRESETCAUSE_WIFI_CONNECTION_LOST);
+}
+
+TEST(UptimeTests, IterateShouldIncreaseUptimeCounters) {
+  Supla::Uptime uptime;
+  uint32_t millis = 0;
+
+  EXPECT_EQ(uptime.getUptime(), 0);
+  EXPECT_EQ(uptime.getConnectionUptime(), 0);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+
+  millis += 999;
+  uptime.iterate(millis);
+  EXPECT_EQ(uptime.getUptime(), 0);
+  EXPECT_EQ(uptime.getConnectionUptime(), 0);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+
+  millis += 1500;
+  uptime.iterate(millis);
+  EXPECT_EQ(uptime.getUptime(), 2);
+  EXPECT_EQ(uptime.getConnectionUptime(), 2);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+
+  millis += 20000;
+  uptime.iterate(millis);
+  EXPECT_EQ(uptime.getUptime(), 22);
+  EXPECT_EQ(uptime.getConnectionUptime(), 22);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+
+  uptime.resetConnectionUptime();
+  EXPECT_EQ(uptime.getUptime(), 22);
+  EXPECT_EQ(uptime.getConnectionUptime(), 0);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+
+  millis += 2500;
+  uptime.iterate(millis);
+  EXPECT_EQ(uptime.getUptime(), 24);
+  EXPECT_EQ(uptime.getConnectionUptime(), 2);
+  EXPECT_EQ(uptime.getLastResetCause(), SUPLA_LASTCONNECTIONRESETCAUSE_UNKNOWN);
+}
+
+TEST(UptimeTests, OverflowTest) {
+  Supla::Uptime uptime;
+  uint32_t millis = 0;
+
+  EXPECT_EQ(uptime.getUptime(), 0);
+
+  bool wasOverflow = false;
+  uint32_t previousMillis = 0;
+  for (int i = 0; i < 100000; i++) {
+    millis += 100000;
+    uptime.iterate(millis);
+    ASSERT_EQ(uptime.getUptime(), (i + 1) * 100);
+
+    if (previousMillis > millis) {
+      wasOverflow = true;
+    }
+    previousMillis = millis;
+  }
+  EXPECT_EQ(wasOverflow, true);
+}

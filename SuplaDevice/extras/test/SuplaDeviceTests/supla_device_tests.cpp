@@ -1,0 +1,1415 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <SuplaDevice.h>
+#include <arduino_mock.h>
+#include <board_mock.h>
+#include <clock_mock.h>
+#include <config_mock.h>
+#include <element_mock.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+#include <network_with_mac_mock.h>
+#include <srpc_mock.h>
+#include <supla-common/log.h>
+#include <supla/clock/clock.h>
+#include <supla/protocol/supla_srpc.h>
+#include <supla/storage/storage.h>
+#include <timer_mock.h>
+#include <storage_mock.h>
+#include <string.h>
+#include <supla/device/register_device.h>
+#include <supla/events.h>
+#include <supla/local_action.h>
+#include <simple_time.h>
+#include "supla/element.h"
+
+using ::testing::_;
+using ::testing::Return;
+
+class SuplaDeviceTests : public ::testing::Test {
+ protected:
+  SimpleTime time;
+
+  void expectNetworkAndConfigInit(NetworkMockWithMac &net,
+                                  ConfigMock &config,
+                                  int setupCalls) {
+    EXPECT_CALL(config, init()).WillOnce(Return(false));
+    EXPECT_CALL(net, setup()).Times(setupCalls);
+  }
+
+  virtual void SetUp() {
+    if (SuplaDevice.getClock()) {
+      delete SuplaDevice.getClock();
+    }
+    Supla::Channel::resetToDefaults();
+  }
+  virtual void TearDown() {
+    if (SuplaDevice.getClock()) {
+      delete SuplaDevice.getClock();
+    }
+    setDeviceSoftwareResetSupported(true);
+    Supla::Channel::resetToDefaults();
+  }
+};
+
+class TimeInterfaceStub : public TimeInterface {
+ public:
+  uint32_t millis() override {
+    static uint32_t value = 0;
+    value += 1000;
+    return value;
+  }
+};
+
+class ConfigModeLocalAction : public Supla::LocalAction {
+ public:
+  bool disableActionsInConfigMode() override {
+    return true;
+  }
+};
+
+class MinimalConfigMock : public ConfigMock {
+ public:
+  bool isMinimalConfigReady(bool) override {
+    return true;
+  }
+};
+
+class NotReadyConfigMock : public ConfigMock {
+ public:
+  bool isMinimalConfigReady(bool) override {
+    return false;
+  }
+};
+
+class LocalActionHandlerMock : public Supla::ActionHandler {
+ public:
+  MOCK_METHOD(void, handleAction, (int, int), (override));
+};
+
+class ConfigModeSuplaDevice : public SuplaDeviceClass {
+ public:
+  void setupDeviceModeForTest(bool configNotComplete,
+                              bool atLeastOneProtoIsEnabled,
+                              bool protocolNotEmpty = false) {
+    configurationState.configNotComplete = configNotComplete;
+    configurationState.atLeastOneProtoIsEnabled = atLeastOneProtoIsEnabled;
+    configurationState.protocolNotEmpty = protocolNotEmpty;
+    setupDeviceMode();
+  }
+
+  void setCfgModeStateForTest(Supla::CfgModeState state) {
+    cfgModeState = state;
+  }
+
+  Supla::CfgModeState getCfgModeStateForTest() const {
+    return cfgModeState;
+  }
+
+  void setCfgModeTimerForTest(uint32_t enterTimestamp,
+                              uint32_t restartTimestamp = 0) {
+    deviceMode = Supla::DEVICE_MODE_CONFIG;
+    enterConfigModeTimestamp = enterTimestamp;
+    deviceRestartTimeoutTimestamp = restartTimestamp;
+  }
+};
+
+class CalcfgRestartDevice : public SuplaDeviceClass {
+ public:
+  uint32_t getForceRestartTimeMs() const {
+    return forceRestartTimeMs;
+  }
+};
+
+class SleepingDeviceForTest : public SuplaDeviceClass {
+ public:
+  void setDeviceModeForTest(Supla::DeviceMode mode) {
+    deviceMode = mode;
+  }
+};
+
+TEST_F(SuplaDeviceTests, SleepPermissionCanBeDeferredAndExpires) {
+  SleepingDeviceForTest sd;
+  sd.setDeviceModeForTest(Supla::DEVICE_MODE_NORMAL);
+
+  EXPECT_TRUE(sd.isSleepingAllowed());
+
+  sd.deferSleep(6500);
+  EXPECT_FALSE(sd.isSleepingAllowed());
+
+  time.advance(6499);
+  EXPECT_FALSE(sd.isSleepingAllowed());
+
+  time.advance(1);
+  EXPECT_TRUE(sd.isSleepingAllowed());
+}
+
+TEST_F(SuplaDeviceTests, SleepPermissionDeferralIsNotShortened) {
+  SleepingDeviceForTest sd;
+  sd.setDeviceModeForTest(Supla::DEVICE_MODE_NORMAL);
+
+  sd.deferSleep(6500);
+  time.advance(5000);
+  sd.deferSleep(1000);
+
+  time.advance(1499);
+  EXPECT_FALSE(sd.isSleepingAllowed());
+
+  time.advance(1);
+  EXPECT_TRUE(sd.isSleepingAllowed());
+}
+
+TEST_F(SuplaDeviceTests, IdentifyDeviceDefersSleep) {
+  SleepingDeviceForTest sd;
+  sd.setDeviceModeForTest(Supla::DEVICE_MODE_NORMAL);
+  TSD_DeviceCalCfgRequest request = {};
+  request.Command = SUPLA_CALCFG_CMD_IDENTIFY_DEVICE;
+  request.SuperUserAuthorized = 1;
+
+  EXPECT_TRUE(sd.isSleepingAllowed());
+  EXPECT_EQ(sd.handleCalcfgFromServer(&request), SUPLA_CALCFG_RESULT_DONE);
+  EXPECT_FALSE(sd.isSleepingAllowed());
+
+  time.advance(6500);
+  EXPECT_TRUE(sd.isSleepingAllowed());
+}
+
+TEST_F(SuplaDeviceTests, CalcfgRestartDeviceUnsupported) {
+  BoardMock board;
+  CalcfgRestartDevice sd;
+  TSD_DeviceCalCfgRequest request = {};
+
+  setDeviceSoftwareResetSupported(false);
+  request.SuperUserAuthorized = 1;
+  request.Command = SUPLA_CALCFG_CMD_RESTART_DEVICE;
+
+  EXPECT_CALL(board, deviceSoftwareReset()).Times(0);
+  EXPECT_EQ(sd.handleCalcfgFromServer(&request),
+            SUPLA_CALCFG_RESULT_NOT_SUPPORTED);
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_UNKNOWN);
+  EXPECT_EQ(sd.getForceRestartTimeMs(), 0);
+}
+
+TEST_F(SuplaDeviceTests, CalcfgRestartDeviceSupported) {
+  BoardMock board;
+  CalcfgRestartDevice sd;
+  TSD_DeviceCalCfgRequest request = {};
+
+  request.SuperUserAuthorized = 1;
+  request.Command = SUPLA_CALCFG_CMD_RESTART_DEVICE;
+
+  EXPECT_CALL(board, deviceSoftwareReset()).Times(0);
+  EXPECT_EQ(sd.handleCalcfgFromServer(&request), SUPLA_CALCFG_RESULT_DONE);
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_SOFTWARE_RESET);
+  EXPECT_EQ(sd.getForceRestartTimeMs(), 1);
+}
+
+TEST_F(SuplaDeviceTests, ReportsRemainingCfgModeInactivityTime) {
+  ConfigModeSuplaDevice sd;
+  time.advance(1000);
+  sd.setLeaveCfgModeAfterInactivityMin(5);
+  sd.setCfgModeTimerForTest(time.value);
+
+  EXPECT_EQ(sd.getCfgModeInactivityTimeLeftMs(), 300000);
+
+  time.advance(270000);
+  EXPECT_EQ(sd.getCfgModeInactivityTimeLeftMs(), 30000);
+
+  sd.restartCfgModeTimeout(false);
+  EXPECT_EQ(sd.getCfgModeInactivityTimeLeftMs(), 300000);
+}
+
+TEST_F(SuplaDeviceTests, CfgModeInactivityTimeIsUnavailableOutsideCfgMode) {
+  ConfigModeSuplaDevice sd;
+
+  EXPECT_EQ(sd.getCfgModeInactivityTimeLeftMs(), UINT32_MAX);
+}
+
+TEST_F(SuplaDeviceTests, DefaultValuesTest) {
+  SuplaDeviceClass sd;
+  SrpcMock srpc;
+  TimerMock timer;
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_UNKNOWN);
+  EXPECT_EQ(sd.getClock(), nullptr);
+}
+
+TEST_F(SuplaDeviceTests,
+       StartInCfgModeKeepsActionsEnabledUntilMinimalConfigIsReady) {
+  SuplaDeviceClass sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartInCfgMode);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(3);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.enterConfigMode();
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       StartInCfgModeDisablesActionsWhenMinimalConfigIsReady) {
+  SuplaDeviceClass sd;
+  NetworkMockWithMac net;
+  MinimalConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartInCfgMode);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.enterConfigMode();
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       StartInCfgModeKeepsActionsDisabledWhenLeavingReentersCfgMode) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+  MinimalConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartInCfgMode);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(1);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.setupDeviceModeForTest(true, true, true);
+  EXPECT_EQ(Supla::DEVICE_MODE_CONFIG, sd.getDeviceMode());
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  EXPECT_EQ(Supla::DEVICE_MODE_CONFIG, sd.getDeviceMode());
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       StartInNotConfiguredModeDisablesActionsWithReadyMinimalConfig) {
+  SuplaDeviceClass sd;
+  NetworkMockWithMac net;
+  MinimalConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartInNotConfiguredMode);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.enterConfigMode();
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       StartInNotConfiguredModeDisablesActionsWithIncompleteConfig) {
+  SuplaDeviceClass sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartInNotConfiguredMode);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.enterConfigMode();
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests, OtherInitialModesAlwaysDisableActionsInConfigMode) {
+  SuplaDeviceClass sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartOffline);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.enterConfigMode();
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests, StartOfflineLeavesConfigModeWithIncompleteConfig) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartOffline);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.setupDeviceModeForTest(true, true, true);
+  EXPECT_EQ(Supla::DEVICE_MODE_CONFIG, sd.getDeviceMode());
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  EXPECT_EQ(Supla::DEVICE_MODE_OFFLINE, sd.getDeviceMode());
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       InitialCfgWindowThenOfflineKeepsActionsWithIncompleteConfig) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartWithCfgModeThenOffline);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(3);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.setupDeviceModeForTest(true, true, true);
+  EXPECT_EQ(Supla::CfgModeState::CfgModeStartedFor1hPending,
+            sd.getCfgModeStateForTest());
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       InitialCfgWindowKeepsActionsAfterPostUntilConfigModeIsLeft) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 3);
+
+  sd.setInitialMode(Supla::InitialMode::StartWithCfgModeThenOffline);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(3);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(4);
+
+  button.runAction(event);
+
+  sd.setupDeviceModeForTest(true, true, true);
+  EXPECT_EQ(Supla::CfgModeState::CfgModeStartedFor1hPending,
+            sd.getCfgModeStateForTest());
+  button.runAction(event);
+
+  sd.restartCfgModeTimeout(true);
+  EXPECT_EQ(Supla::CfgModeState::CfgModeStartedFor1hPending,
+            sd.getCfgModeStateForTest());
+  sd.disableLocalActionsIfNeeded();
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  EXPECT_EQ(Supla::DEVICE_MODE_OFFLINE, sd.getDeviceMode());
+  EXPECT_EQ(Supla::CfgModeState::Done, sd.getCfgModeStateForTest());
+
+  sd.enterConfigMode();
+  EXPECT_EQ(Supla::CfgModeState::CfgModeStartedPending,
+            sd.getCfgModeStateForTest());
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       CfgEntryAfterThenOfflineWindowAlwaysDisablesActions) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartWithCfgModeThenOffline);
+  sd.setCfgModeStateForTest(Supla::CfgModeState::Done);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.enterConfigMode();
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       ConfiguredThenOfflineDeviceDoesNotReuseInitialCfgWindow) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+  NotReadyConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartWithCfgModeThenOffline);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  sd.setupDeviceModeForTest(false, true, true);
+  EXPECT_EQ(Supla::CfgModeState::NotSet, sd.getCfgModeStateForTest());
+  button.runAction(event);
+
+  sd.enterConfigMode();
+  EXPECT_EQ(Supla::CfgModeState::CfgModeStartedPending,
+            sd.getCfgModeStateForTest());
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests,
+       ThenOfflineModeDoesNotStartInitialCfgWindowWhenGoingOffline) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+
+  sd.setInitialMode(Supla::InitialMode::StartWithCfgModeThenOffline);
+  sd.setupDeviceModeForTest(true, false);
+
+  EXPECT_EQ(Supla::DEVICE_MODE_OFFLINE, sd.getDeviceMode());
+  EXPECT_EQ(Supla::CfgModeState::NotSet, sd.getCfgModeStateForTest());
+}
+
+TEST_F(SuplaDeviceTests,
+       InitialCfgWindowThenOfflineDisablesActionsWithReadyConfig) {
+  ConfigModeSuplaDevice sd;
+  NetworkMockWithMac net;
+  MinimalConfigMock config;
+  ConfigModeLocalAction button;
+  LocalActionHandlerMock localHandler;
+  LocalActionHandlerMock configHandler;
+  constexpr int event = 11;
+
+  expectNetworkAndConfigInit(net, config, 2);
+
+  sd.setInitialMode(Supla::InitialMode::StartWithCfgModeThenOffline);
+  button.addAction(1, localHandler, event);
+  button.addAction(2, configHandler, event, true);
+
+  EXPECT_CALL(localHandler, handleAction(event, 1)).Times(2);
+  EXPECT_CALL(configHandler, handleAction(event, 2)).Times(3);
+
+  button.runAction(event);
+
+  sd.setupDeviceModeForTest(true, true, true);
+  EXPECT_EQ(Supla::CfgModeState::CfgModeStartedFor1hPending,
+            sd.getCfgModeStateForTest());
+  button.runAction(event);
+
+  sd.leaveConfigModeWithoutRestart();
+  button.runAction(event);
+}
+
+TEST_F(SuplaDeviceTests, SetLogLevelUpdatesGlobalFilter) {
+  SuplaDeviceClass sd;
+  int oldLevel = supla_log_get_level();
+
+  sd.setLogLevel(LOG_DEBUG);
+  EXPECT_EQ(sd.getLogLevel(), LOG_DEBUG);
+  EXPECT_TRUE(supla_log_is_enabled(LOG_DEBUG));
+  EXPECT_FALSE(supla_log_is_enabled(LOG_VERBOSE));
+
+  sd.setLogLevel(LOG_VERBOSE);
+  EXPECT_TRUE(supla_log_is_enabled(LOG_VERBOSE));
+
+  supla_log_set_level(oldLevel);
+}
+
+TEST_F(SuplaDeviceTests, ClockMethods) {
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  ASSERT_EQ(sd.getClock(), nullptr);
+  srpcLayer.onGetUserLocaltimeResult(nullptr);
+
+  ClockMock clock;
+  ASSERT_EQ(sd.getClock(), &clock);
+
+  EXPECT_CALL(clock, parseLocaltimeFromServer(nullptr)).Times(1);
+
+  srpcLayer.onGetUserLocaltimeResult(nullptr);
+}
+
+TEST_F(SuplaDeviceTests, StartWithoutNetworkInterfaceNoElements) {
+  SuplaDeviceClass sd;
+  TimerMock timer;
+
+  ASSERT_EQ(Supla::Element::begin(), nullptr);
+  EXPECT_CALL(timer, initTimers());
+
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_MISSING_NETWORK_INTERFACE);
+}
+
+TEST_F(SuplaDeviceTests, StartWithoutNetworkInterfaceNoElementsWithStorage) {
+  SuplaDeviceClass sd;
+  TimerMock timer;
+  StorageMockSimulator storage;
+
+  if (Supla::Element::begin()) {
+    ASSERT_EQ(Supla::Element::begin(), nullptr);
+  }
+
+  ASSERT_EQ(Supla::Element::begin(), nullptr);
+  EXPECT_CALL(storage, commit()).Times(1);
+
+  ::testing::InSequence seq;
+  EXPECT_CALL(timer, initTimers());
+
+  EXPECT_TRUE(storage.isEmpty());
+
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_MISSING_NETWORK_INTERFACE);
+
+  EXPECT_TRUE(storage.isPreampleInitialized());
+}
+
+TEST_F(SuplaDeviceTests,
+       StartWithoutNetworkInterfaceNoElementsWithStorageAndDataLoadAttempt) {
+  SuplaDeviceClass sd;
+  TimerMock timer;
+  StorageMockSimulator storage;
+  EXPECT_CALL(storage, commit()).Times(1);
+
+  ::testing::InSequence seq;
+  ASSERT_EQ(Supla::Element::begin(), nullptr);
+  EXPECT_CALL(timer, initTimers());
+
+  EXPECT_TRUE(storage.isEmpty());
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_MISSING_NETWORK_INTERFACE);
+  EXPECT_TRUE(storage.isPreampleInitialized());
+}
+
+TEST_F(SuplaDeviceTests, StartWithoutNetworkInterfaceWithElements) {
+  ::testing::InSequence seq;
+  SuplaDeviceClass sd;
+  TimerMock timer;
+  ElementMock el1;
+  ElementMock el2;
+
+  ASSERT_NE(Supla::Element::begin(), nullptr);
+
+  EXPECT_CALL(el1, onInit());
+  EXPECT_CALL(el2, onInit());
+
+  EXPECT_CALL(timer, initTimers());
+  EXPECT_CALL(el1, onTimer());
+  EXPECT_CALL(el2, onTimer());
+  EXPECT_CALL(el1, onFastTimer());
+  EXPECT_CALL(el2, onFastTimer());
+
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_MISSING_NETWORK_INTERFACE);
+  sd.onTimer();
+  sd.onFastTimer();
+}
+
+TEST_F(SuplaDeviceTests, StartWithoutNetworkInterfaceWithElementsWithStorage) {
+  StorageMockSimulator storage;
+  EXPECT_CALL(storage, commit()).Times(1);
+  SuplaDeviceClass sd;
+  TimerMock timer;
+  ElementMock el1;
+  ElementMock el2;
+
+  ::testing::InSequence seq;
+  ASSERT_NE(Supla::Element::begin(), nullptr);
+
+  EXPECT_CALL(el1, onSaveState());
+  EXPECT_CALL(el2, onSaveState());
+
+  EXPECT_CALL(el1, onLoadState());
+  EXPECT_CALL(el2, onLoadState());
+
+  EXPECT_CALL(el1, onInit());
+  EXPECT_CALL(el2, onInit());
+
+  EXPECT_CALL(timer, initTimers());
+
+  EXPECT_TRUE(storage.isEmpty());
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_MISSING_NETWORK_INTERFACE);
+  EXPECT_TRUE(storage.isPreampleInitialized());
+}
+
+TEST_F(SuplaDeviceTests, BeginStopsAtEmptyGUID) {
+  ::testing::InSequence seq;
+  NetworkMockWithMac net;
+  TimerMock timer;
+
+  SuplaDeviceClass sd;
+
+  EXPECT_CALL(timer, initTimers());
+
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INVALID_GUID);
+}
+
+TEST_F(SuplaDeviceTests, BeginStopsAtEmptyAuthkey) {
+  ::testing::InSequence seq;
+  NetworkMockWithMac net;
+  TimerMock timer;
+
+  SuplaDeviceClass sd;
+
+  EXPECT_CALL(timer, initTimers());
+
+  char GUID[SUPLA_GUID_SIZE] = {1};
+  sd.setGUID(GUID);
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INVALID_AUTHKEY);
+}
+
+TEST_F(SuplaDeviceTests, BeginAcceptsEmptyServer) {
+  // with AD support, empty server is not an issue
+  ::testing::InSequence seq;
+  NetworkMockWithMac net;
+  TimerMock timer;
+
+  SuplaDeviceClass sd;
+
+  EXPECT_CALL(timer, initTimers());
+  EXPECT_CALL(net, getMacAddr(_)).WillRepeatedly(Return(false));
+
+  char GUID[SUPLA_GUID_SIZE] = {1};
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {2};
+  sd.setGUID(GUID);
+  sd.setAuthKey(AUTHKEY);
+  sd.setEmail("john@supla");
+  EXPECT_TRUE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INITIALIZED);
+}
+
+TEST_F(SuplaDeviceTests, BeginStopsAtEmptyEmail) {
+  ::testing::InSequence seq;
+  NetworkMockWithMac net;
+  TimerMock timer;
+
+  SuplaDeviceClass sd;
+
+  EXPECT_CALL(timer, initTimers());
+
+  char GUID[SUPLA_GUID_SIZE] = {1};
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {2};
+  sd.setGUID(GUID);
+  sd.setAuthKey(AUTHKEY);
+  sd.setServer("supla.rulez");
+  EXPECT_FALSE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_MISSING_CREDENTIALS);
+}
+
+TEST_F(SuplaDeviceTests, SuccessfulBegin) {
+  SrpcMock srpc;
+  NetworkMockWithMac net;
+  TimerMock timer;
+
+  EXPECT_CALL(net, getMacAddr(_)).WillRepeatedly(Return(false));
+
+  ::testing::InSequence seq;
+  SuplaDeviceClass sd;
+
+  EXPECT_CALL(timer, initTimers());
+
+  char GUID[SUPLA_GUID_SIZE] = {1};
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {2};
+  sd.setGUID(GUID);
+  sd.setServer("supla.rulez");
+  sd.setEmail("john@supla");
+  sd.setAuthKey(AUTHKEY);
+  EXPECT_TRUE(sd.begin());
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INITIALIZED);
+}
+
+TEST_F(SuplaDeviceTests, SuccessfulBeginAlternative) {
+  SrpcMock srpc;
+  NetworkMockWithMac net;
+  TimerMock timer;
+  EXPECT_CALL(net, getMacAddr(_)).WillRepeatedly(Return(false));
+
+  ::testing::InSequence seq;
+  SuplaDeviceClass sd;
+
+  EXPECT_CALL(timer, initTimers());
+
+  char GUID[SUPLA_GUID_SIZE] = {1};
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {2};
+  EXPECT_TRUE(sd.begin(GUID, "supla.rulez", "superman@supla.org", AUTHKEY));
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INITIALIZED);
+}
+
+TEST_F(SuplaDeviceTests, FailedBeginAlternativeOnEmptyAUTHKEY) {
+  ::testing::InSequence seq;
+  SrpcMock srpc;
+  NetworkMockWithMac net;
+  TimerMock timer;
+
+  SuplaDeviceClass sd;
+
+  EXPECT_CALL(timer, initTimers());
+
+  char GUID[SUPLA_GUID_SIZE] = {1};
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {0};
+  EXPECT_FALSE(sd.begin(GUID, "supla.rulez", "superman@supla.org", AUTHKEY));
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INVALID_AUTHKEY);
+}
+
+TEST_F(SuplaDeviceTests, TwoChannelElementsNoNetworkWithStorage) {
+  SrpcMock srpc;
+  NetworkMockWithMac net;
+  EXPECT_CALL(net, getMacAddr(_)).WillRepeatedly(Return(false));
+  StorageMockSimulator storage;
+  EXPECT_CALL(storage, commit()).Times(2);
+  TimerMock timer;
+  SuplaDeviceClass sd;
+  ElementMock el1;
+  ElementMock el2;
+  EXPECT_CALL(el1, onSaveState());
+  EXPECT_CALL(el2, onSaveState());
+
+  EXPECT_CALL(el1, onLoadState());
+  EXPECT_CALL(el2, onLoadState());
+
+  EXPECT_CALL(el1, onInit());
+  EXPECT_CALL(el2, onInit());
+
+  EXPECT_CALL(timer, initTimers());
+  EXPECT_CALL(net, setup());
+
+  char GUID[SUPLA_GUID_SIZE] = {1};
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {2};
+  EXPECT_TRUE(storage.isEmpty());
+  EXPECT_TRUE(sd.begin(GUID, "supla.rulez", "superman@supla.org", AUTHKEY));
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INITIALIZED);
+  EXPECT_CALL(el1, iterateAlways()).Times(2);
+  EXPECT_CALL(el2, iterateAlways()).Times(2);
+  EXPECT_CALL(net, isReady()).WillRepeatedly(Return(false));
+
+  EXPECT_CALL(el1, onSaveState());
+  EXPECT_CALL(el2, onSaveState());
+  time.advance(2000);
+
+  for (int i = 0; i < 2; i++) sd.iterate();
+  EXPECT_TRUE(storage.isPreampleInitialized());
+}
+
+TEST_F(SuplaDeviceTests, OnVersionErrorSetsProtocolVersionErrorStatus) {
+  NetworkMockWithMac net;
+  TimeInterfaceStub time;
+
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  TSDC_SuplaVersionError versionError{};
+
+  srpcLayer.onVersionError(&versionError);
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_PROTOCOL_VERSION_ERROR);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultOK) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(1);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_TRUE;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_REGISTERED_AND_READY);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultRestartRequested) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  CalcfgRestartDevice sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(1);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_RESTART_REQUESTED;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 25;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_SOFTWARE_RESET);
+  EXPECT_EQ(sd.getForceRestartTimeMs(), 1);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultIdentifyRequested) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  SleepingDeviceForTest sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+  LocalActionHandlerMock identifyHandler;
+
+  sd.setDeviceModeForTest(Supla::DEVICE_MODE_NORMAL);
+
+  EXPECT_CALL(identifyHandler,
+              handleAction(Supla::ON_IDENTIFY, 123)).Times(1);
+  sd.addAction(123, identifyHandler, Supla::ON_IDENTIFY);
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(1);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_IDENTIFY_REQUESTED;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 25;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_REGISTERED_AND_READY);
+  EXPECT_FALSE(sd.isSleepingAllowed());
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultBadCredentials) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_BAD_CREDENTIALS;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_BAD_CREDENTIALS);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultTemporairlyUnavailable) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_TEMPORARILY_UNAVAILABLE;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_TEMPORARILY_UNAVAILABLE);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultLocationConflict) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_LOCATION_CONFLICT;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_LOCATION_CONFLICT);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultChannelConflict) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_CHANNEL_CONFLICT;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_CHANNEL_CONFLICT);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultDeviceDisabled) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_DEVICE_DISABLED;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_DEVICE_IS_DISABLED);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultLocationDisabled) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_LOCATION_DISABLED;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_LOCATION_IS_DISABLED);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultDeviceLimitExceeded) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_DEVICE_LIMITEXCEEDED;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_DEVICE_LIMIT_EXCEEDED);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultGuidError) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_GUID_ERROR;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INVALID_GUID);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultAuthKeyError) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_AUTHKEY_ERROR;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_INVALID_AUTHKEY);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultRegistrationDisabled) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_REGISTRATION_DISABLED;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_REGISTRATION_DISABLED);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultNoLocationAvailable) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = SUPLA_RESULTCODE_NO_LOCATION_AVAILABLE;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_NO_LOCATION_AVAILABLE);
+}
+
+TEST_F(SuplaDeviceTests, OnRegisterResultUnknownError) {
+  NetworkMockWithMac net;
+  SrpcMock srpc;
+  TimeInterfaceStub time;
+  SuplaDeviceClass sd;
+  Supla::Protocol::SuplaSrpc srpcLayer(&sd);
+
+  EXPECT_CALL(srpc, srpc_dcs_async_set_activity_timeout(_, _)).Times(0);
+
+  TSD_SuplaRegisterDeviceResult register_device_result{};
+  register_device_result.result_code = 666;
+  register_device_result.activity_timeout = 45;
+  register_device_result.version = 20;
+  register_device_result.version_min = 1;
+
+  srpcLayer.onRegisterResult(&register_device_result);
+
+  EXPECT_EQ(sd.getCurrentStatus(), STATUS_UNKNOWN_ERROR);
+}
+
+TEST_F(SuplaDeviceTests, GenerateHostnameTests) {
+  NetworkMockWithMac net;
+  SuplaDeviceClass sd;
+  char buf[200];
+  EXPECT_STREQ(Supla::RegisterDevice::getName(), "");
+  sd.setName("Supla Device");
+
+  EXPECT_CALL(net, getMacAddr(_)).WillRepeatedly(Return(true));
+
+  EXPECT_STREQ(Supla::RegisterDevice::getName(), "Supla Device");
+
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-000000000000");
+
+  sd.generateHostname(buf, 1);
+  net.setHostname(buf, 1);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-00");
+
+  sd.generateHostname(buf, 2);
+  net.setHostname(buf, 2);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-0000");
+
+  sd.generateHostname(buf, 3);
+  net.setHostname(buf, 3);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-000000");
+
+  sd.generateHostname(buf, 4);
+  net.setHostname(buf, 4);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-00000000");
+
+  sd.generateHostname(buf, 5);
+  net.setHostname(buf, 5);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-0000000000");
+
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-000000000000");
+
+  sd.generateHostname(buf, 7);
+  net.setHostname(buf, 7);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-000000000000");
+
+  sd.generateHostname(buf, 0);
+  net.setHostname(buf, 0);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE");
+
+  sd.generateHostname(buf, -1);
+  net.setHostname(buf, -1);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE");
+
+  sd.setName("SuPlA Is SuPeR");
+  sd.generateHostname(buf, -1);
+  net.setHostname(buf, -1);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-IS-SUPER");
+
+  sd.setName("SuPlA Is SuPeR Even with a very long device name");
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-IS-SUPER-EVE-000000000000");
+
+  sd.generateHostname(buf, 2);
+  net.setHostname(buf, 2);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-IS-SUPER-EVEN-WITH-A-0000");
+
+  Supla::Channel::resetToDefaults();
+  sd.generateHostname(buf, 2);
+  net.setHostname(buf, 2);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-0000");
+
+  sd.setName("- - TEST   DupliCate");
+  sd.generateHostname(buf, 2);
+  net.setHostname(buf, 2);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "TEST-DUPLICATE-0000");
+
+  /*
+  sd.setName("My Device 2.54");
+  sd.generateHostname(buf, 2);
+  EXPECT_STREQ(buf, "SUPLA-MY-DEVICE-2-54-0000");
+  */
+}
+
+TEST_F(SuplaDeviceTests, GenerateHostnameForOHTests) {
+  NetworkMockWithMac net;
+  SuplaDeviceClass sd;
+  char buf[200];
+  EXPECT_STREQ(Supla::RegisterDevice::getName(), "");
+  sd.setName("OH! Amazing!! Device");
+
+  EXPECT_CALL(net, getMacAddr(_)).WillRepeatedly(Return(true));
+
+  EXPECT_STREQ(Supla::RegisterDevice::getName(), "OH! Amazing!! Device");
+
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-AMAZING-DEVI-000000000000");
+
+  sd.setName("OH!Really???");
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-REALLY-000000000000");
+}
+
+TEST_F(SuplaDeviceTests, GenerateHostnameWithCustomPrefixTests) {
+  NetworkMockWithMac net;
+  SuplaDeviceClass sd;
+  char buf[200];
+  EXPECT_STREQ(Supla::RegisterDevice::getName(), "");
+  sd.setName("Amazing Device");
+
+  EXPECT_CALL(net, getMacAddr(_)).WillRepeatedly(Return(true));
+
+  EXPECT_STREQ(Supla::RegisterDevice::getName(), "Amazing Device");
+
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "AMAZING-DEVICE-000000000000");
+
+  char prefix[] = "My prefix";
+  sd.setCustomHostnamePrefix(prefix);
+
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "MY-PREFIX-000000000000");
+
+  sd.generateHostname(buf, 7);
+  net.setHostname(buf, 7);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "MY-PREFIX-000000000000");
+
+  sd.generateHostname(buf, 0);
+  net.setHostname(buf, 0);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "MY-PREFIX");
+
+  sd.generateHostname(buf, -1);
+  net.setHostname(buf, -1);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "MY-PREFIX");
+
+  sd.setName("SuPlA Is SuPeR");
+  sd.generateHostname(buf, -1);
+  net.setHostname(buf, -1);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "MY-PREFIX");
+
+  sd.setCustomHostnamePrefix(nullptr);
+
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-IS-SUPER-000000000000");
+
+  char emptyPrefix[1] = {};
+  sd.setCustomHostnamePrefix(emptyPrefix);
+
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-IS-SUPER-000000000000");
+
+  Supla::Channel::resetToDefaults();
+  sd.generateHostname(buf, 2);
+  net.setHostname(buf, 2);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-DEVICE-0000");
+
+  sd.setCustomHostnamePrefix("SUPLA-ABCDEFG-GEN3");
+  sd.generateHostname(buf, 6);
+  net.setHostname(buf, 6);
+  net.getHostName(buf);
+  EXPECT_STREQ(buf, "SUPLA-ABCDEFG-GEN3-000000000000");
+}

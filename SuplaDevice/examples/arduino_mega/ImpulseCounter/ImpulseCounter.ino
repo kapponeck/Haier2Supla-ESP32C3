@@ -1,0 +1,100 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/**
+ * @supla-example
+ * @file ImpulseCounter.ino
+ * @brief Example of implementing impulse counters with optional LED feedback for SUPLA using an Arduino Mega.
+ * This example demonstrates how to configure two impulse counters on different pins (counting rising or falling edges, with debounce).
+ * It also shows how to trigger an internal LED (blink or toggle) upon each impulse count.
+ * The device integrates with the SUPLA cloud via an Ethernet shield (W5100 or ENC28J60)
+ * and can store counter data persistently in EEPROM (or optionally FRAM).
+ * Users need to adjust network settings, SUPLA GUID, AUTHKEY, and GPIO pins for the impulse counters and LEDs in the code.
+ *
+ * @tags impulse, counter, LED, debounce, EEPROM, FRAM, arduino_mega, ethernet, w5100, enc28j60
+ */
+#include <SuplaDevice.h>
+#include <supla/sensor/impulse_counter.h>
+// Remove below line if you don't want to have internal LED blinking on each
+// impulse
+#include <supla/actions.h>
+#include <supla/control/internal_pin_output.h>
+#include <supla/events.h>
+
+// Choose where Supla should store counter data in persistant memory
+// We recommend to use external FRAM memory
+// #define FRAM_CS_PIN TBD // choose a free GPIO and replace TBD
+// #define STORAGE_OFFSET 100
+// #include <supla/storage/fram_spi.h>
+// Supla::FramSpi fram(FRAM_CS_PIN, STORAGE_OFFSET);
+#include <supla/storage/eeprom.h>
+Supla::Eeprom eeprom;
+
+// Choose proper network interface for your card:
+// Arduino Mega with EthernetShield W5100:
+#include <supla/network/ethernet_shield.h>
+// Ethernet MAC address
+uint8_t mac[6] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
+Supla::EthernetShield ethernet(mac);
+
+// Arduino Mega with ENC28J60:
+// #include <supla/network/ENC28J60.h>
+// Supla::ENC28J60 ethernet(mac);
+
+void setup() {
+  Serial.begin(115200);
+
+  // Replace the falowing GUID with value that you can retrieve from
+  // https://www.supla.org/arduino/get-guid
+  char GUID[SUPLA_GUID_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+  // Replace the following AUTHKEY with value that you can retrieve from:
+  // https://www.supla.org/arduino/get-authkey
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00};
+
+  /*
+   * Having your device already registered at cloud.supla.org,
+   * you want to change CHANNEL sequence or remove any of them,
+   * then you must also remove the device itself from cloud.supla.org.
+   * Otherwise you will get "Channel conflict!" error.
+   */
+
+  // CHANNEL0 - Impulse Counter on pin 34, counting raising edge (from LOW to
+  // HIGH), no pullup on pin, and 10 ms debounce timeout
+  auto ic1 = new Supla::Sensor::ImpulseCounter(34, true, false, 10);
+
+  // CHANNEL1 - Impulse Counter on pin 35, counting falling edge (from HIGH to
+  // LOW), with pullup on pin, and 50 ms debounce timeout
+  auto ic2 = new Supla::Sensor::ImpulseCounter(35, false, true, 50);
+
+  // Configuring internal LED to notify each change of impulse counter
+  auto led1 = new Supla::Control::InternalPinOutput(24);  // LED on pin 24
+  auto led2 = new Supla::Control::InternalPinOutput(25);  // LED on pin 25
+
+  // LED1 will blink (100 ms) on each change of ic1
+  led1->setDurationMs(100);
+  ic1->addAction(Supla::TURN_ON, led1, Supla::ON_CHANGE);
+
+  // LED2 will toggle it's state on each change of ic2
+  ic2->addAction(Supla::TOGGLE, led2, Supla::ON_CHANGE);
+
+  /*
+   * Server address is available at https://cloud.supla.org
+   * If you do not have an account, you can create it at
+   * https://cloud.supla.org/account/create SUPLA and SUPLA CLOUD are free of
+   * charge
+   */
+
+  SuplaDevice.begin(
+      GUID,              // Global Unique Identifier
+      "svr1.supla.org",  // SUPLA server address
+      "email@address",   // Email address used to login to Supla Cloud
+      AUTHKEY);          // Authorization key
+}
+
+void loop() {
+  SuplaDevice.iterate();
+}

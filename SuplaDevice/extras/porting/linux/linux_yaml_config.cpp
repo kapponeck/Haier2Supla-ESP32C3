@@ -1,0 +1,3182 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "linux_yaml_config.h"
+
+#include <supla-common/proto.h>
+#include <supla/control/action_trigger_parsed.h>
+#include <supla/control/cmd_relay.h>
+#include <supla/control/cmd_roller_shutter.h>
+#include <supla/control/cmd_valve.h>
+#include <supla/control/control_payload.h>
+#include <supla/control/custom_relay.h>
+#include <supla/control/rgbcct_parsed.h>
+#include <supla/control/virtual_relay.h>
+#include <supla/custom_channel.h>
+#include <supla/device/register_device.h>
+#include <supla/log_wrapper.h>
+#include <supla/network/ip_address.h>
+#include <supla/output/cmd.h>
+#include <supla/output/file.h>
+#include <supla/output/mqtt.h>
+#include <supla/output/output.h>
+#include <supla/parser/json.h>
+#include <supla/parser/parser.h>
+#include <supla/parser/simple.h>
+#include <supla/payload/json.h>
+#include <supla/payload/simple.h>
+#include <supla/pv/afore.h>
+#include <supla/pv/fronius.h>
+#include <supla/pv/solaredge.h>
+#include <supla/sensor/binary_parsed.h>
+#include <supla/sensor/container_parsed.h>
+#include <supla/sensor/distance_parsed.h>
+#include <supla/sensor/electricity_meter_parsed.h>
+#include <supla/sensor/general_purpose_measurement_parsed.h>
+#include <supla/sensor/general_purpose_meter_parsed.h>
+#include <supla/sensor/humidity_parsed.h>
+#include <supla/sensor/impulse_counter_parsed.h>
+#include <supla/sensor/pressure_parsed.h>
+#include <supla/sensor/rain_parsed.h>
+#include <supla/sensor/thermometer_parsed.h>
+#include <supla/sensor/weight_parsed.h>
+#include <supla/sensor/wind_parsed.h>
+#include <supla/source/cmd.h>
+#include <supla/source/file.h>
+#ifdef SUPLA_LINUX_HTTP_SOURCE_ENABLED
+#include <supla/source/http.h>
+#endif
+#include <SuplaDevice.h>
+#include <supla/source/mqtt_src.h>
+#include <supla/source/source.h>
+#include <supla/tools.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <filesystem>  // NOLINT(build/c++17)
+#include <fstream>
+#include <limits>
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "linux_channel_factory.h"
+#include "linux_extension_init.h"
+#include "linux_secure_file.h"
+#include "supla/control/custom_hvac.h"
+#include "supla/control/hvac_parsed.h"
+#include "supla/sensor/sensor_parsed.h"
+#include "supla/sensor/therm_hygro_meter_parsed.h"
+#include "supla/storage/key_value.h"
+
+namespace Supla {
+const char Multiplier[] = "multiplier";
+const char MultiplierTemp[] = "multiplier_temp";
+const char MultiplierHumi[] = "multiplier_humi";
+const char InitialCaption[] = "initial_caption";
+const char ChannelType[] = "channel_type";
+const char DefaultFunction[] = "default_function";
+const char DefaultFunctionNumber[] = "default_function_number";
+const char Value[] = "value";
+const char ManufacturerId[] = "manufacturer_id";
+const char ProductId[] = "product_id";
+
+const char GuidAuthFileName[] = "/guid_auth.yaml";
+const char ReadWriteConfigStorage[] = "/config_storage.bin";
+const char GuidKey[] = "guid";
+const char AuthKeyKey[] = "authkey";
+};  // namespace Supla
+
+#define SUPLA_LINUX_CONFIG_BUF_SIZE (1024 * 1024)
+
+Supla::LinuxYamlConfig::LinuxYamlConfig(const std::string& file) : file(file) {
+}
+
+Supla::LinuxYamlConfig::~LinuxYamlConfig() {
+  // Parsers and payloads keep non-owning pointers to sources and outputs.
+  // Destroy those dependants before releasing the objects they reference.
+  for (const auto& entry : payloads) {
+    delete entry.second;
+  }
+  for (const auto& entry : parsers) {
+    delete entry.second;
+  }
+  for (const auto& entry : outputs) {
+    delete entry.second;
+  }
+  for (const auto& entry : sources) {
+    delete entry.second;
+  }
+}
+
+void Supla::LinuxYamlConfig::markChannelParameterUsed() {
+  untrackedChannelParameterCount++;
+}
+
+YAML::Node Supla::LinuxYamlConfig::getAndMarkChannelParameter(
+    const YAML::Node& channel, const char* parameter) {
+  YAML::Node value = channel[parameter];
+  if (value) {
+    usedChannelParameters.insert(parameter);
+  }
+  return value;
+}
+
+bool Supla::LinuxYamlConfig::addCommonChannelParameters(
+    const YAML::Node& ch, Supla::Element* element) {
+  return addCommonParameters(ch, element);
+}
+
+void Supla::LinuxYamlConfig::logError(const std::string& filename,
+                                      const YAML::Exception& ex) const {
+  if (ex.mark.line >= 0 && ex.mark.column >= 0) {
+    SUPLA_LOG_ERROR("Config file YAML error in '%s' at line %d, column %d: %s",
+                    filename.c_str(),
+                    ex.mark.line + 1,
+                    ex.mark.column + 1,
+                    ex.what());
+  } else {
+    SUPLA_LOG_ERROR(
+        "Config file YAML error in '%s': %s", filename.c_str(), ex.what());
+  }
+}
+
+bool Supla::LinuxYamlConfig::init() {
+  if (initDone) {
+    return true;
+  }
+
+  initDone = true;
+  if (config.size() == 0) {
+    try {
+      config = YAML::LoadFile(file);
+      if (config["security_level"]) {
+        int securityLevel = config["security_level"].as<int>();
+        if (securityLevel == 1) {
+          SUPLA_LOG_ERROR(
+              "Config: security_level 1 (custom CA) is not supported on "
+              "sd4linux");
+          return false;
+        }
+        if (securityLevel != 0 && securityLevel != 2) {
+          SUPLA_LOG_ERROR(
+              "Config: unsupported security_level %d (allowed values: 0, 2)",
+              securityLevel);
+          return false;
+        }
+      }
+      if (config["log_level"]) {
+        std::string logLevel = config["log_level"].as<std::string>();
+        if (logLevel != "info" && logLevel != "debug" &&
+            logLevel != "verbose" && logLevel != "warning" &&
+            logLevel != "error") {
+          SUPLA_LOG_ERROR("Config: unsupported log_level \"%s\"",
+                          logLevel.c_str());
+          return false;
+        }
+      }
+      if (config[Supla::ManufacturerId]) {
+        auto manufacturerId = config[Supla::ManufacturerId].as<int>();
+        if (manufacturerId < 0 ||
+            manufacturerId > std::numeric_limits<int16_t>::max()) {
+          SUPLA_LOG_ERROR("Config: manufacturer_id out of range");
+          return false;
+        }
+        Supla::RegisterDevice::setManufacturerId(
+            static_cast<int16_t>(manufacturerId));
+      }
+      if (config[Supla::ProductId]) {
+        auto productId = config[Supla::ProductId].as<int>();
+        if (productId < 0 || productId > std::numeric_limits<int16_t>::max()) {
+          SUPLA_LOG_ERROR("Config: product_id out of range");
+          return false;
+        }
+        Supla::RegisterDevice::setProductId(static_cast<int16_t>(productId));
+      }
+      loadGuidAuthFromPath(getStateFilesPath());
+    } catch (const YAML::Exception& ex) {
+      logError(file, ex);
+      return false;
+    }
+  }
+  // check if KeyValue was initialized earlier
+  if (first) {
+    SUPLA_LOG_WARNING("init called on non empty database. Aborting");
+    // init can be done only on empty storage
+    return false;
+  }
+
+  std::string readWriteConfigFilePath =
+      getStateFilesPath() + Supla::ReadWriteConfigStorage;
+
+  uint8_t buf[SUPLA_LINUX_CONFIG_BUF_SIZE] = {};
+  if (std::filesystem::exists(readWriteConfigFilePath)) {
+    SUPLA_LOG_INFO("Read write config storage file: %s",
+                   readWriteConfigFilePath.c_str());
+
+    std::ifstream rwConfigFile(readWriteConfigFilePath,
+                               std::ifstream::in | std::ios::binary);
+
+    unsigned char c = rwConfigFile.get();
+
+    int bytesRead = 0;
+    for (; rwConfigFile.good() && bytesRead < SUPLA_LINUX_CONFIG_BUF_SIZE;
+         bytesRead++) {
+      buf[bytesRead] = c;
+      c = rwConfigFile.get();
+    }
+
+    rwConfigFile.close();
+
+    if (bytesRead >= SUPLA_LINUX_CONFIG_BUF_SIZE) {
+      SUPLA_LOG_ERROR("Read write config: buffer overflow - file is too big");
+      return false;
+    }
+
+    SUPLA_LOG_INFO("Read write config: initializing storage from file...");
+    return initFromMemory(buf, bytesRead);
+  } else {
+    SUPLA_LOG_INFO(
+        "Read write config: config file missing, starting with empty database");
+  }
+
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::isDebug() {
+  try {
+    if (config["log_level"]) {
+      auto logLevel = config["log_level"].as<std::string>();
+      if (logLevel == "debug") {
+        return true;
+      }
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::isVerbose() {
+  try {
+    if (config["log_level"]) {
+      auto logLevel = config["log_level"].as<std::string>();
+      if (logLevel == "verbose") {
+        return true;
+      }
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::isWarning() {
+  try {
+    if (config["log_level"]) {
+      auto logLevel = config["log_level"].as<std::string>();
+      if (logLevel == "warning") {
+        return true;
+      }
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::isError() {
+  try {
+    if (config["log_level"]) {
+      auto logLevel = config["log_level"].as<std::string>();
+      if (logLevel == "error") {
+        return true;
+      }
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::isProtoVerboseLog() {
+  try {
+    if (config["proto_verbose_log"]) {
+      return config["proto_verbose_log"].as<bool>();
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::generateGuidAndAuthkey() {
+  char guid[SUPLA_GUID_SIZE] = {};
+  char authkey[SUPLA_AUTHKEY_SIZE] = {};
+
+  Supla::fillRandom(reinterpret_cast<uint8_t*>(guid), SUPLA_GUID_SIZE);
+  Supla::fillRandom(reinterpret_cast<uint8_t*>(authkey), SUPLA_AUTHKEY_SIZE);
+
+  if (isArrayEmpty(guid, SUPLA_GUID_SIZE)) {
+    SUPLA_LOG_ERROR("Failed to generate GUID");
+    return false;
+  }
+  if (isArrayEmpty(authkey, SUPLA_AUTHKEY_SIZE)) {
+    SUPLA_LOG_ERROR("Failed to generate AUTHKEY");
+    return false;
+  }
+
+  setGUID(guid);
+  setAuthKey(authkey);
+
+  return saveGuidAuth(getStateFilesPath());
+}
+
+// Currently "security_level" is read from yaml config and for all other
+// parameters we fallback to KeyValue getUInt8.
+// This method will first look for param in yaml, and if it is missing, it
+// will look for it in KeyValue storage
+bool Supla::LinuxYamlConfig::getUInt8(const char* key, uint8_t* result) {
+  try {
+    if (config[key]) {
+      *result = static_cast<uint8_t>(config[key].as<unsigned int>());
+      return true;
+    } else {
+      return Supla::KeyValue::getUInt8(key, result);
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+void Supla::LinuxYamlConfig::commit() {
+  uint8_t buf[SUPLA_LINUX_CONFIG_BUF_SIZE] = {};
+
+  size_t dataSize = serializeToMemory(buf, SUPLA_LINUX_CONFIG_BUF_SIZE);
+
+  std::ofstream rwConfigFile(
+      getStateFilesPath() + Supla::ReadWriteConfigStorage,
+      std::ofstream::out | std::ios::binary);
+
+  for (size_t i = 0; i < dataSize; i++) {
+    rwConfigFile << buf[i];
+  }
+
+  rwConfigFile.close();
+}
+
+bool Supla::LinuxYamlConfig::setDeviceName(const char* name) {
+  (void)name;
+  SUPLA_LOG_WARNING("setDeviceName is not supported on this platform");
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::setSuplaCommProtocolEnabled(bool enabled) {
+  (void)enabled;
+  SUPLA_LOG_WARNING(
+      "setSuplaCommProtocolEnabled is not supported on this platform");
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::setSuplaServerPort(int32_t port) {
+  (void)port;
+  SUPLA_LOG_WARNING("setSuplaServerPort is not supported on this platform");
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::setEmail(const char* email) {
+  (void)email;
+  SUPLA_LOG_WARNING("setEmail is not supported on this platform");
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::getDeviceName(char* result) {
+  try {
+    if (config["name"]) {
+      auto deviceName = config["name"].as<std::string>();
+      strncpy(result, deviceName.c_str(), SUPLA_DEVICE_NAME_MAXSIZE);
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::isSuplaCommProtocolEnabled() {
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::getSuplaServer(char* result) {
+  try {
+    if (config["supla"] && config["supla"]["server"]) {
+      auto server = config["supla"]["server"].as<std::string>();
+      strncpy(result, server.c_str(), SUPLA_SERVER_NAME_MAXSIZE);
+      char tmp[SUPLA_SERVER_NAME_MAXSIZE] = {};
+      if (Supla::Config::getSuplaServer(tmp)) {
+        SUPLA_LOG_DEBUG("Cleaning Config Supla server name: %s", tmp);
+        setSuplaServer("");
+        saveWithDelay(1000);
+      }
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return Supla::Config::getSuplaServer(result);
+}
+
+int32_t Supla::LinuxYamlConfig::getSuplaServerPort() {
+  // sd4linux uses only the TLS SUPLA endpoint.  Keep the shared Config API
+  // intact for other platforms, but do not expose a configurable port here.
+  return 2016;
+}
+
+bool Supla::LinuxYamlConfig::getEmail(char* result) {
+  try {
+    if (config["supla"] && config["supla"]["mail"]) {
+      auto mail = config["supla"]["mail"].as<std::string>();
+      strncpy(result, mail.c_str(), SUPLA_EMAIL_MAXSIZE);
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+int Supla::LinuxYamlConfig::getProtoVersion() {
+  try {
+    if (config["supla"] && config["supla"]["proto"]) {
+      auto version = config["supla"]["proto"].as<int>();
+      if (version < 23) {
+        return 23;
+      }
+      if (version > SUPLA_PROTO_VERSION) {
+        return SUPLA_PROTO_VERSION;
+      }
+      return version;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return 27;
+}
+
+bool Supla::LinuxYamlConfig::setGUID(const char* guidRaw) {
+  char guidHex[SUPLA_GUID_HEXSIZE] = {};
+  generateHexString(guidRaw, guidHex, SUPLA_GUID_SIZE);
+  guid = std::string(guidHex);
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::getGUID(char* result) {
+  if (guid.length()) {
+    return hexStringToArray(guid.c_str(), result, SUPLA_GUID_SIZE);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::setAuthKey(const char* authkeyRaw) {
+  char authkeyHex[SUPLA_AUTHKEY_HEXSIZE] = {};
+  generateHexString(authkeyRaw, authkeyHex, SUPLA_AUTHKEY_SIZE);
+  authkey = std::string(authkeyHex);
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::getAuthKey(char* result) {
+  if (authkey.length()) {
+    return hexStringToArray(authkey.c_str(), result, SUPLA_AUTHKEY_SIZE);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::getMqttClientHost(char* result) const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["host"]) {
+      auto mqtt_host = config["mqtt"]["host"].as<std::string>();
+      std::copy(mqtt_host.begin(), mqtt_host.end(), result);
+      result[mqtt_host.size()] = '\0';
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+int32_t Supla::LinuxYamlConfig::getMqttClientPort() const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["port"]) {
+      auto mqtt_port = config["mqtt"]["port"].as<int>();
+      return mqtt_port;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return config["mqtt"] && config["mqtt"]["use_ssl"] ? 8883 : 1883;
+}
+
+bool Supla::LinuxYamlConfig::getMqttClientUsername(char* result) const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["username"]) {
+      auto mqtt_username = config["mqtt"]["username"].as<std::string>("");
+      std::copy(mqtt_username.begin(), mqtt_username.end(), result);
+      result[mqtt_username.size()] = '\0';
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::getMqttClientPassword(char* result) const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["password"]) {
+      auto mqtt_password = config["mqtt"]["password"].as<std::string>("");
+      std::copy(mqtt_password.begin(), mqtt_password.end(), result);
+      result[mqtt_password.size()] = '\0';
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::getMqttClientName(char* result) const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["client_name"]) {
+      auto mqtt_client_name = config["mqtt"]["client_name"].as<std::string>();
+      std::copy(mqtt_client_name.begin(), mqtt_client_name.end(), result);
+      result[mqtt_client_name.size()] = '\0';
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::getMqttClientUseSSL() const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["use_ssl"]) {
+      auto mqtt_use_ssl = config["mqtt"]["use_ssl"].as<bool>();
+      return mqtt_use_ssl;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::getMqttClientVerifyCA() const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["verify_ca"]) {
+      auto mqtt_secure = config["mqtt"]["verify_ca"].as<bool>();
+      return mqtt_secure;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::getMqttClientFileCA(char* result) const {
+  try {
+    if (config["mqtt"] && config["mqtt"]["ca_file"]) {
+      auto mqtt_ca_file = config["mqtt"]["ca_file"].as<std::string>("");
+      std::copy(mqtt_ca_file.begin(), mqtt_ca_file.end(), result);
+      result[mqtt_ca_file.size()] = '\0';
+      return true;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::loadChannels() {
+  try {
+    Supla::Linux::initExtensions();
+    if (!loadTopLevelSources(config["sources"])) {
+      return false;
+    }
+    if (!loadTopLevelParsers(config["parsers"])) {
+      return false;
+    }
+    if (config["channels"]) {
+      auto channels = config["channels"];
+      int channelCount = 0;
+      for (auto it : channels) {
+        usedChannelParameters.clear();
+        untrackedChannelParameterCount = 0;
+        // parseChannel and channel handlers mark used parameters
+        if (!parseChannel(it, channelCount)) {
+          SUPLA_LOG_ERROR("Config: parsing channel %d failed", channelCount);
+          return false;
+        }
+        if (untrackedChannelParameterCount == 0) {
+          bool unrecognizedParameterFound = false;
+          for (const auto& parameter : it) {
+            const auto parameterName = parameter.first.as<std::string>();
+            if (!usedChannelParameters.count(parameterName)) {
+              const auto line = parameter.first.Mark().line;
+              SUPLA_LOG_ERROR(
+                  "Channel[%d] config: unrecognized parameter \"%s\""
+                  " at line %d",
+                  channelCount,
+                  parameterName.c_str(),
+                  line >= 0 ? line + 1 : 0);
+              unrecognizedParameterFound = true;
+            }
+          }
+          if (unrecognizedParameterFound) {
+            return false;
+          }
+        } else if (it.size() > usedChannelParameters.size() +
+                                   untrackedChannelParameterCount) {
+          SUPLA_LOG_ERROR("Channel[%d] config contains unrecognized parameters",
+                          channelCount);
+          return false;
+        }
+        channelCount++;
+      }
+      if (channelCount == 0) {
+        SUPLA_LOG_ERROR("Config: \"channels\" section missing in file");
+        return false;
+      }
+      return true;
+    } else {
+      SUPLA_LOG_ERROR("Config: \"channels\" section missing in file");
+      return false;
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::loadTopLevelSources(
+    const YAML::Node& sourcesNode) {
+  if (!sourcesNode) {
+    return true;
+  }
+  if (!sourcesNode.IsMap()) {
+    SUPLA_LOG_ERROR("Config: \"sources\" section has to be a map");
+    return false;
+  }
+
+  for (const auto& sourceEntry : sourcesNode) {
+    std::string name = sourceEntry.first.as<std::string>();
+    if (name.empty()) {
+      SUPLA_LOG_ERROR("Config: empty source name in \"sources\" section");
+      return false;
+    }
+    if (!sourceEntry.second.IsMap()) {
+      SUPLA_LOG_ERROR("Config: source \"%s\" has to be a map", name.c_str());
+      return false;
+    }
+    if (!addSourceWithName(sourceEntry.second, name)) {
+      SUPLA_LOG_ERROR("Config: adding source \"%s\" failed", name.c_str());
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::loadTopLevelParsers(
+    const YAML::Node& parsersNode) {
+  if (!parsersNode) {
+    return true;
+  }
+  if (!parsersNode.IsMap()) {
+    SUPLA_LOG_ERROR("Config: \"parsers\" section has to be a map");
+    return false;
+  }
+
+  for (const auto& parserEntry : parsersNode) {
+    std::string name = parserEntry.first.as<std::string>();
+    if (name.empty()) {
+      SUPLA_LOG_ERROR("Config: empty parser name in \"parsers\" section");
+      return false;
+    }
+    if (!parserEntry.second.IsMap()) {
+      SUPLA_LOG_ERROR("Config: parser \"%s\" has to be a map", name.c_str());
+      return false;
+    }
+    if (parserEntry.second["name"]) {
+      SUPLA_LOG_ERROR("Config: parser \"%s\" can't define \"name\" parameter",
+                      name.c_str());
+      return false;
+    }
+    if (parserEntry.second["use"]) {
+      SUPLA_LOG_ERROR("Config: parser \"%s\" can't define \"use\" parameter",
+                      name.c_str());
+      return false;
+    }
+    if (!parserEntry.second["source"]) {
+      SUPLA_LOG_ERROR("Config: parser \"%s\" has no \"source\" parameter",
+                      name.c_str());
+      return false;
+    }
+    if (!parserEntry.second["source"].IsScalar()) {
+      SUPLA_LOG_ERROR("Config: parser \"%s\" source has to be a source name",
+                      name.c_str());
+      return false;
+    }
+
+    std::string sourceName = parserEntry.second["source"].as<std::string>();
+    auto source = findSource(sourceName);
+    if (!source) {
+      SUPLA_LOG_ERROR("Config: parser \"%s\" references unknown source \"%s\"",
+                      name.c_str(),
+                      sourceName.c_str());
+      return false;
+    }
+
+    YAML::Node parser = YAML::Clone(parserEntry.second);
+    parser.remove("source");
+    if (!addParserWithName(parser, name, source)) {
+      SUPLA_LOG_ERROR("Config: adding parser \"%s\" failed", name.c_str());
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::parseChannel(const YAML::Node& ch,
+                                          int channelIndex) {
+  if (channelIndex >= SUPLA_CHANNELMAXCOUNT) {
+    SUPLA_LOG_ERROR("Config: too many channels (max %d)",
+                    SUPLA_CHANNELMAXCOUNT);
+    return false;
+  }
+  if (auto typeParameter = getAndMarkChannelParameter(ch, "type")) {
+    std::string type = typeParameter.as<std::string>();
+
+    Supla::Source::Source* source = nullptr;
+    Supla::Parser::Parser* parser = nullptr;
+    Supla::Output::Output* output = nullptr;
+    Supla::Payload::Payload* payload = nullptr;
+
+    if (auto sourceParameter = getAndMarkChannelParameter(ch, "source")) {
+      if (sourceParameter.IsScalar()) {
+        source = findSource(sourceParameter.as<std::string>());
+        if (!source) {
+          SUPLA_LOG_ERROR("Config: can't find source with \"name\"=\"%s\"",
+                          sourceParameter.as<std::string>().c_str());
+          return false;
+        }
+      } else if (!(source = addSource(sourceParameter))) {
+        SUPLA_LOG_ERROR("Adding source failed");
+        return false;
+      }
+    }
+
+    if (auto parserParameter = getAndMarkChannelParameter(ch, "parser")) {
+      if (parserParameter.IsScalar()) {
+        parser = findParser(parserParameter.as<std::string>());
+        if (!parser) {
+          SUPLA_LOG_ERROR("Config: can't find parser with \"name\"=\"%s\"",
+                          parserParameter.as<std::string>().c_str());
+          return false;
+        }
+      } else if (!(parser = addParser(parserParameter, source))) {
+        SUPLA_LOG_ERROR("Adding parser failed");
+        return false;
+      }
+    }
+
+    if (auto outputParameter = getAndMarkChannelParameter(ch, "output")) {
+      if (!(output = addOutput(outputParameter))) {
+        SUPLA_LOG_ERROR("Adding output failed");
+        return false;
+      }
+    }
+
+    if (auto payloadParameter = getAndMarkChannelParameter(ch, "payload")) {
+      if (!(payload = addPayload(payloadParameter, output))) {
+        SUPLA_LOG_ERROR("Adding payload failed");
+        return false;
+      }
+      payloadCount++;
+    }
+
+    int channelNumber = -1;
+    bool channelNumberConfigured = false;
+    if (auto channelNumberParameter =
+            getAndMarkChannelParameter(ch, "channel_number")) {
+      channelNumberConfigured = true;
+      channelNumber = channelNumberParameter.as<int>();
+      if (channelNumber < 0 || channelNumber >= SUPLA_CHANNELMAXCOUNT) {
+        SUPLA_LOG_ERROR(
+            "Config: channel_number has to be in range 0..%d",
+            SUPLA_CHANNELMAXCOUNT - 1);
+        return false;
+      }
+    }
+    if (channelNumber == -1) {
+      channelNumber = channelIndex;
+    }
+    if (channelNumberConfigured &&
+        !Supla::RegisterDevice::isChannelNumberFree(channelNumber)) {
+      SUPLA_LOG_ERROR("Config: channel_number %d is already in use",
+                      channelNumber);
+      return false;
+    }
+
+    if (auto nameParameter = getAndMarkChannelParameter(ch, "name")) {
+      std::string name = nameParameter.as<std::string>();
+      channelNames[name] = channelNumber;
+    }
+
+    if (type == "VirtualRelay") {
+      return addVirtualRelay(ch, channelNumber);
+    } else if (type == "CmdRelay") {
+      return addCmdRelay(ch, channelNumber, parser);
+    } else if (type == "CustomRelay") {
+      return addCustomRelay(ch, channelNumber, parser, payload);
+    } else if (type == "CmdValve") {
+      return addCmdValve(ch, channelNumber, parser);
+    } else if (type == "CmdRollerShutter") {
+      return addCmdRollerShutter(ch, channelNumber, parser);
+    } else if (type == "RgbCctParsed") {
+      return addRgbCctParsed(ch, channelNumber, parser);
+    } else if (type == "Fronius") {
+      return addFronius(ch, channelNumber);
+    } else if (type == "SolarEdge") {
+      return addSolarEdge(ch, channelNumber);
+    } else if (type == "Afore") {
+      return addAfore(ch, channelNumber);
+    } else if (type == "Hvac") {
+      return addHvac(ch, channelNumber);
+    } else if (type == "CustomHvac") {
+      return addCustomHvac(ch, channelNumber, payload);
+    } else if (type == "ThermometerParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addThermometerParsed(ch, channelNumber, parser);
+    } else if (type == "GeneralPurposeMeasurementParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addGeneralPurposeMeasurementParsed(ch, channelNumber, parser);
+    } else if (type == "GeneralPurposeMeterParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addGeneralPurposeMeterParsed(ch, channelNumber, parser);
+    } else if (type == "ImpulseCounterParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addImpulseCounterParsed(ch, channelNumber, parser);
+    } else if (type == "ElectricityMeterParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addElectricityMeterParsed(ch, channelNumber, parser);
+    } else if (type == "BinaryParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addBinaryParsed(ch, channelNumber, parser);
+    } else if (type == "HumidityParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addHumidityParsed(ch, channelNumber, parser);
+    } else if (type == "PressureParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addPressureParsed(ch, channelNumber, parser);
+    } else if (type == "WindParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addWindParsed(ch, channelNumber, parser);
+    } else if (type == "RainParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addRainParsed(ch, channelNumber, parser);
+    } else if (type == "WeightParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addWeightParsed(ch, channelNumber, parser);
+    } else if (type == "ContainerParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addContainerParsed(ch, channelNumber, parser);
+    } else if (type == "DistanceParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addDistanceParsed(ch, channelNumber, parser);
+    } else if (type == "ThermHygroMeterParsed") {
+      if (!parser) {
+        SUPLA_LOG_ERROR("Channel[%d] config: missing parser", channelNumber);
+        return false;
+      }
+      return addThermHygroMeterParsed(ch, channelNumber, parser);
+    } else if (type == "ActionTriggerParsed") {
+      return addActionTriggerParsed(ch, channelNumber);
+    } else if (type == "CustomChannel") {
+      return addCustomChannel(ch, channelNumber, parser);
+    } else {
+      auto factory =
+          Supla::Linux::ChannelFactoryRegistry::instance().findByType(type);
+      if (factory) {
+        Supla::Linux::ChannelFactoryContext context{
+            *this,
+            ch,
+            channelNumber,
+            source,
+            parser,
+            output,
+            payload,
+        };
+        return factory->factory(context);
+      }
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown type \"%s\"",
+                      channelNumber,
+                      type.c_str());
+      return false;
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing mandatory \"type\" parameter",
+                    channelIndex);
+  }
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::addVirtualRelay(const YAML::Node& ch,
+                                             int channelNumber) {
+  std::string initialState;
+  if (auto initialStateParameter =
+          getAndMarkChannelParameter(ch, "initial_state")) {
+    initialState = initialStateParameter.as<std::string>();
+    if (initialState != "on" && initialState != "off" &&
+        initialState != "restore") {
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown initial state \"%s\"",
+                      channelNumber,
+                      initialState.c_str());
+      return false;
+    }
+  }
+
+  SUPLA_LOG_INFO("Channel[%d] config: adding VirtualRelay", channelNumber);
+  auto vr = new Supla::Control::VirtualRelay();
+  if (!initialState.empty()) {
+    if (initialState == "on") {
+      vr->setDefaultStateOn();
+    } else if (initialState == "off") {
+      vr->setDefaultStateOff();
+    } else if (initialState == "restore") {
+      vr->setDefaultStateRestore();
+    }
+  }
+  if (!addRelayDefaultFunction(ch, vr)) {
+    return false;
+  }
+  return addCommonParameters(ch, vr);
+}
+
+bool Supla::LinuxYamlConfig::addCmdRelay(const YAML::Node& ch,
+                                         int channelNumber,
+                                         Supla::Parser::Parser* parser) {
+  std::string initialState;
+  if (auto initialStateParameter =
+          getAndMarkChannelParameter(ch, "initial_state")) {
+    initialState = initialStateParameter.as<std::string>();
+    if (initialState != "on" && initialState != "off" &&
+        initialState != "restore") {
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown initial state \"%s\"",
+                      channelNumber,
+                      initialState.c_str());
+      return false;
+    }
+  }
+
+  SUPLA_LOG_INFO("Channel[%d] config: adding CmdRelay", channelNumber);
+  auto cr = new Supla::Control::CmdRelay(parser);
+  if (!initialState.empty()) {
+    if (initialState == "on") {
+      cr->setDefaultStateOn();
+    } else if (initialState == "off") {
+      cr->setDefaultStateOff();
+    } else if (initialState == "restore") {
+      cr->setDefaultStateRestore();
+    }
+  }
+
+  if (auto offlineParameter =
+          getAndMarkChannelParameter(ch, "offline_on_invalid_state")) {
+    auto useOfflineOnInvalidState = offlineParameter.as<bool>();
+    cr->setUseOfflineOnInvalidState(useOfflineOnInvalidState);
+  }
+
+  if (auto cmdOnParameter = getAndMarkChannelParameter(ch, "cmd_on")) {
+    auto cmdOn = cmdOnParameter.as<std::string>();
+    cr->setCmdOn(cmdOn);
+  }
+  if (auto cmdOffParameter = getAndMarkChannelParameter(ch, "cmd_off")) {
+    auto cmdOff = cmdOffParameter.as<std::string>();
+    cr->setCmdOff(cmdOff);
+  }
+
+  if (!addStateParser(ch, cr, parser, false)) {
+    return false;
+  }
+
+  if (!addActionTriggerActions(ch, cr, false)) {
+    return false;
+  }
+
+  if (!addRelayDefaultFunction(ch, cr)) {
+    return false;
+  }
+  return addCommonParametersParsed(ch, cr, parser);
+}
+
+bool Supla::LinuxYamlConfig::addCmdValve(const YAML::Node& ch,
+                                         int channelNumber,
+                                         Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding CmdValve", channelNumber);
+  auto cv = new Supla::Control::CmdValve(parser);
+
+  if (auto cmdOpenParameter = getAndMarkChannelParameter(ch, "cmd_open")) {
+    auto cmdOpen = cmdOpenParameter.as<std::string>();
+    cv->setCmdOpen(cmdOpen);
+  } else {
+    SUPLA_LOG_ERROR("CmdValve[%d]: missing \"cmd_open\" parameter",
+                    channelNumber);
+    return false;
+  }
+  if (auto cmdCloseParameter = getAndMarkChannelParameter(ch, "cmd_close")) {
+    auto cmdClose = cmdCloseParameter.as<std::string>();
+    cv->setCmdClose(cmdClose);
+  } else {
+    SUPLA_LOG_ERROR("CmdValve[%d]: missing \"cmd_close\" parameter",
+                    channelNumber);
+    return false;
+  }
+
+  if (!addStateParser(ch, cv, parser, true)) {
+    return false;
+  }
+
+  return addCommonParametersParsed(ch, cv, parser);
+}
+
+bool Supla::LinuxYamlConfig::addRgbCctParsed(const YAML::Node& ch,
+                                             int channelNumber,
+                                             Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding RgbCctParsed", channelNumber);
+  auto rgb = new Supla::Control::RgbCctParsed(parser);
+  if (auto offlineParameter =
+          getAndMarkChannelParameter(ch, "offline_on_invalid_state")) {
+    auto useOfflineOnInvalidState = offlineParameter.as<bool>();
+    rgb->setUseOfflineOnInvalidState(useOfflineOnInvalidState);
+  }
+  if (auto fadeEffectParameter =
+          getAndMarkChannelParameter(ch, "fade_effect_ms")) {
+    auto fadeEffectMs = fadeEffectParameter.as<int>();
+    rgb->setFadeEffectTime(fadeEffectMs);
+  }
+  if (!addStateParser(ch, rgb, parser, false)) {
+    return false;
+  }
+
+  return addCommonParametersParsed(ch, rgb, parser);
+}
+
+bool Supla::LinuxYamlConfig::addCmdRollerShutter(
+    const YAML::Node& ch, int channelNumber, Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding CmdRollerShutter", channelNumber);
+  auto cr = new Supla::Control::CmdRollerShutter(parser);
+
+  if (auto offlineParameter =
+          getAndMarkChannelParameter(ch, "offline_on_invalid_state")) {
+    auto useOfflineOnInvalidState = offlineParameter.as<bool>();
+    cr->setUseOfflineOnInvalidState(useOfflineOnInvalidState);
+  }
+
+  if (auto cmdUpOnParameter = getAndMarkChannelParameter(ch, "cmd_up_on")) {
+    auto cmdUpOn = cmdUpOnParameter.as<std::string>();
+    cr->setCmdUpOn(cmdUpOn);
+  } else {
+    SUPLA_LOG_ERROR(
+        "CmdRollerShutter[%d]: missing \"cmd_up_on\" parameter",
+        channelNumber);
+    return false;
+  }
+  if (auto cmdUpOffParameter = getAndMarkChannelParameter(ch, "cmd_up_off")) {
+    auto cmdUpOff = cmdUpOffParameter.as<std::string>();
+    cr->setCmdUpOff(cmdUpOff);
+  } else {
+    SUPLA_LOG_ERROR(
+        "CmdRollerShutter[%d]: missing \"cmd_up_off\" parameter",
+        channelNumber);
+    return false;
+  }
+
+  if (auto cmdDownOnParameter = getAndMarkChannelParameter(ch, "cmd_down_on")) {
+    auto cmdDownOn = cmdDownOnParameter.as<std::string>();
+    cr->setCmdDownOn(cmdDownOn);
+  } else {
+    SUPLA_LOG_ERROR(
+        "CmdRollerShutter[%d]: missing \"cmd_down_on\" parameter",
+        channelNumber);
+    return false;
+  }
+  if (auto cmdDownOffParameter =
+          getAndMarkChannelParameter(ch, "cmd_down_off")) {
+    auto cmdDownOff = cmdDownOffParameter.as<std::string>();
+    cr->setCmdDownOff(cmdDownOff);
+  } else {
+    SUPLA_LOG_ERROR(
+        "CmdRollerShutter[%d]: missing \"cmd_down_off\" parameter",
+        channelNumber);
+    return false;
+  }
+
+  return addCommonParametersParsed(ch, cr, parser);
+}
+
+bool Supla::LinuxYamlConfig::addCustomRelay(const YAML::Node& ch,
+                                            int channelNumber,
+                                            Parser::Parser* parser,
+                                            Payload::Payload* payload) {
+  std::string initialState;
+  if (auto initialStateParameter =
+          getAndMarkChannelParameter(ch, "initial_state")) {
+    initialState = initialStateParameter.as<std::string>();
+    if (initialState != "on" && initialState != "off" &&
+        initialState != "restore") {
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown initial state \"%s\"",
+                      channelNumber,
+                      initialState.c_str());
+      return false;
+    }
+  }
+
+  SUPLA_LOG_INFO("Channel[%d] config: adding CustomRelay", channelNumber);
+  if (payload == nullptr) {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: CustomRelay requires output and payload",
+        channelNumber);
+    return false;
+  }
+  auto cr = new Supla::Control::CustomRelay(parser, payload);
+  if (!initialState.empty()) {
+    if (initialState == "on") {
+      cr->setDefaultStateOn();
+    } else if (initialState == "off") {
+      cr->setDefaultStateOff();
+    } else if (initialState == "restore") {
+      cr->setDefaultStateRestore();
+    }
+  }
+
+  if (auto offlineParameter =
+          getAndMarkChannelParameter(ch, "offline_on_invalid_state")) {
+    auto useOfflineOnInvalidState = offlineParameter.as<bool>();
+    cr->setUseOfflineOnInvalidState(useOfflineOnInvalidState);
+  }
+
+  if (auto turnOnParameter =
+          getAndMarkChannelParameter(ch, "turn_on_payload")) {
+    auto turnOnPayload = turnOnParameter.as<std::string>();
+    cr->setSetOnValue(turnOnPayload);
+  }
+  if (auto turnOffParameter =
+          getAndMarkChannelParameter(ch, "turn_off_payload")) {
+    auto turnOffPayload = turnOffParameter.as<std::string>();
+    cr->setSetOffValue(turnOffPayload);
+  }
+
+  if (!addStateParser(ch, cr, parser, false)) {
+    return false;
+  }
+
+  if (!addStatePayload(ch, cr, payload, !payload->isBasedOnIndex())) {
+    return false;
+  }
+
+  if (!addActionTriggerActions(ch, cr, false)) {
+    return false;
+  }
+
+  if (!addRelayDefaultFunction(ch, cr)) {
+    return false;
+  }
+  return addCommonParametersParsed(ch, cr, parser);
+}
+
+bool Supla::LinuxYamlConfig::addFronius(const YAML::Node& ch,
+                                        int channelNumber) {
+  int port = 80;
+  int deviceId = 1;
+  int deviceType = 0;
+  if (auto portParameter = getAndMarkChannelParameter(ch, "port")) {
+    port = portParameter.as<int>();
+  }
+  if (auto deviceIdParameter = getAndMarkChannelParameter(ch, "device_id")) {
+    deviceId = deviceIdParameter.as<int>();
+  }
+  if (auto deviceTypeParameter =
+          getAndMarkChannelParameter(ch, "device_type")) {
+    deviceType = deviceTypeParameter.as<int>();
+    if (!Supla::PV::Fronius::isDeviceTypeSupported(deviceType)) {
+      SUPLA_LOG_ERROR("Channel[%d] config: unsupported Fronius device_type: %d",
+                      channelNumber,
+                      deviceType);
+      return false;
+    }
+  }
+
+  if (auto ipParameter = getAndMarkChannelParameter(ch, "ip")) {
+    std::string ip = ipParameter.as<std::string>();
+    SUPLA_LOG_INFO(
+        "Channel[%d] config: adding Fronius with IP %s, port: %d, deviceId: %d",
+        channelNumber,
+        ip.c_str(),
+        port,
+        deviceId);
+
+    IPAddress ipAddr(ip);
+    auto fronius = new Supla::PV::Fronius(ipAddr, port, deviceId, deviceType);
+    return addCommonParameters(ch, fronius);
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing mandatory \"ip\" parameter",
+                    channelNumber);
+    return false;
+  }
+
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::addSolarEdge(const YAML::Node& ch,
+                                          int channelNumber) {
+  std::string apiKey;
+  std::string siteId;
+  std::string inverterSerialNumber;
+
+  if (auto apiKeyParameter = getAndMarkChannelParameter(ch, "api_key")) {
+    apiKey = apiKeyParameter.as<std::string>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory \"api_key\" parameter",
+        channelNumber);
+    return false;
+  }
+
+  if (auto siteIdParameter = getAndMarkChannelParameter(ch, "site_id")) {
+    siteId = siteIdParameter.as<std::string>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory \"site_id\" parameter",
+        channelNumber);
+    return false;
+  }
+
+  if (auto inverterSerialParameter =
+          getAndMarkChannelParameter(ch, "inverter_serial_number")) {
+    inverterSerialNumber = inverterSerialParameter.as<std::string>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory "
+        "\"inverter_serial_number\" parameter",
+        channelNumber);
+    return false;
+  }
+
+  auto clock = SuplaDevice.getClock();
+  if (!clock) {
+    SUPLA_LOG_ERROR("Channel[%d] config: SolarEdge requires a configured clock",
+                    channelNumber);
+    return false;
+  }
+
+  SUPLA_LOG_INFO(
+      "Channel[%d] config: adding SolarEdge with site_id %s, inverter "
+      "serial %s",
+      channelNumber,
+      siteId.c_str(),
+      inverterSerialNumber.c_str());
+
+  auto solarEdge = new Supla::PV::SolarEdge(
+      apiKey.c_str(), siteId.c_str(), inverterSerialNumber.c_str(), clock);
+  return addCommonParameters(ch, solarEdge);
+}
+
+bool Supla::LinuxYamlConfig::addAfore(const YAML::Node& ch, int channelNumber) {
+  int port = 80;
+  if (auto portParameter = getAndMarkChannelParameter(ch, "port")) {
+    port = portParameter.as<int>();
+  }
+
+  std::string loginAndPassword;
+
+  if (auto loginParameter =
+          getAndMarkChannelParameter(ch, "login_and_password")) {
+    loginAndPassword = loginParameter.as<std::string>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory"
+        " \"login_and_password\" parameter",
+        channelNumber);
+    return false;
+  }
+
+  if (auto ipParameter = getAndMarkChannelParameter(ch, "ip")) {
+    std::string ip = ipParameter.as<std::string>();
+    SUPLA_LOG_INFO(
+        "Channel[%d] config: adding Afore with IP %s, port: %d,"
+        " login_and_password: %s",
+        channelNumber,
+        ip.c_str(),
+        port,
+        loginAndPassword.c_str());
+
+    IPAddress ipAddr(ip);
+    auto afore = new Supla::PV::Afore(ipAddr, port, loginAndPassword.c_str());
+    return addCommonParameters(ch, afore);
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing mandatory \"ip\" parameter",
+                    channelNumber);
+    return false;
+  }
+
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::addHvac(const YAML::Node& ch, int channelNumber) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding Hvac", channelNumber);
+  int mainThermometerChannelNo = -1;
+  int auxThermometerChannelNo = -1;
+  int binarySensorChannelNo = -1;
+  std::string cmdOn;
+  std::string cmdOff;
+  std::string cmdOnSecondary;
+  std::string cmdOffSecondary;
+  if (auto cmdOnParameter = getAndMarkChannelParameter(ch, "cmd_on")) {
+    cmdOn = cmdOnParameter.as<std::string>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory \"cmd_on\" parameter",
+        channelNumber);
+    return false;
+  }
+  if (auto cmdOffParameter = getAndMarkChannelParameter(ch, "cmd_off")) {
+    cmdOff = cmdOffParameter.as<std::string>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory \"cmd_off\" parameter",
+        channelNumber);
+    return false;
+  }
+  if (auto cmdOnSecondaryParameter =
+          getAndMarkChannelParameter(ch, "cmd_on_secondary")) {
+    cmdOnSecondary = cmdOnSecondaryParameter.as<std::string>();
+  }
+  if (auto cmdOffSecondaryParameter =
+          getAndMarkChannelParameter(ch, "cmd_off_secondary")) {
+    cmdOffSecondary = cmdOffSecondaryParameter.as<std::string>();
+  }
+  if (auto mainThermometerParameter =
+          getAndMarkChannelParameter(ch, "main_thermometer_channel_no")) {
+    mainThermometerChannelNo = mainThermometerParameter.as<int>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory \"main_thermometer_channel_no\" "
+        "parameter",
+        channelNumber);
+    return false;
+  }
+  if (auto auxThermometerParameter =
+          getAndMarkChannelParameter(ch, "aux_thermometer_channel_no")) {
+    auxThermometerChannelNo = auxThermometerParameter.as<int>();
+  }
+
+  if (auto binarySensorParameter =
+          getAndMarkChannelParameter(ch, "binary_sensor_channel_no")) {
+    binarySensorChannelNo = binarySensorParameter.as<int>();
+  }
+
+  auto hvac = new Supla::Control::HvacParsed(
+      cmdOn, cmdOff, cmdOnSecondary, cmdOffSecondary);
+  hvac->setMainThermometerChannelNo(mainThermometerChannelNo);
+  hvac->setAuxThermometerChannelNo(auxThermometerChannelNo);
+  if (binarySensorChannelNo >= 0) {
+    hvac->setBinarySensorChannelNo(binarySensorChannelNo);
+  }
+  hvac->setAuxThermometerType(SUPLA_HVAC_AUX_THERMOMETER_TYPE_NOT_SET);
+  if (hvac->getChannelNumber() != auxThermometerChannelNo) {
+    hvac->setAuxThermometerType(SUPLA_HVAC_AUX_THERMOMETER_TYPE_FLOOR);
+  }
+  hvac->setTemperatureHisteresisMin(20);        // 0.2 degree
+  hvac->setTemperatureHisteresisMax(1000);      // 10 degree
+  hvac->setTemperatureHeatCoolOffsetMin(200);   // 2 degrees
+  hvac->setTemperatureHeatCoolOffsetMax(1000);  // 10 degrees
+  hvac->setTemperatureAuxMin(500);              // 5 degrees
+  hvac->setTemperatureAuxMax(7500);             // 75 degrees
+  hvac->addAvailableAlgorithm(SUPLA_HVAC_ALGORITHM_ON_OFF_SETPOINT_MIDDLE);
+
+  hvac->setTemperatureHisteresis(40);
+
+  if (auto defaultFunctionParameter =
+          getAndMarkChannelParameter(ch, Supla::DefaultFunction)) {
+    std::string function = defaultFunctionParameter.as<std::string>();
+    if (function == "heat") {
+      hvac->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_HVAC_THERMOSTAT);
+      hvac->setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_HEAT);
+    } else if (function == "cool") {
+      hvac->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_HVAC_THERMOSTAT);
+      hvac->setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_COOL);
+    } else if (function == "heat_cool") {
+      if (cmdOnSecondary.empty() || cmdOffSecondary.empty()) {
+        SUPLA_LOG_ERROR(
+            "Channel[%d] config: missing mandatory \"cmd_on_secondary\" or "
+            "\"cmd_off_secondary\" parameter when setting \"heat_cool\" "
+            "function",
+            channelNumber);
+        return false;
+      }
+      hvac->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_HVAC_THERMOSTAT_HEAT_COOL);
+    } else if (function == "dhw") {
+      hvac->enableDomesticHotWaterFunctionSupport();
+      hvac->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_HVAC_DOMESTIC_HOT_WATER);
+    } else if (function == "diff") {
+      hvac->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_HVAC_THERMOSTAT_DIFFERENTIAL);
+    } else {
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown default function \"%s\"",
+                      channelNumber,
+                      function.c_str());
+      return false;
+    }
+  }
+  return addCommonParameters(ch, hvac);
+}
+
+bool Supla::LinuxYamlConfig::addCustomHvac(const YAML::Node& ch,
+                                           int channelNumber,
+                                           Payload::Payload* payload) {
+  if (payload == nullptr) {
+    SUPLA_LOG_ERROR("Channel[%d] config: CustomHvac requires a valid payload",
+                    channelNumber);
+    return false;
+  }
+
+  SUPLA_LOG_INFO("Channel[%d] config: adding CustomHvac", channelNumber);
+  int mainThermometerChannelNo = -1;
+  int auxThermometerChannelNo = -1;
+  int binarySensorChannelNo = -1;
+  auto hvac = new Supla::Control::CustomHvac(payload);
+  if (auto turnOnParameter =
+          getAndMarkChannelParameter(ch, "turn_on_payload")) {
+    auto turnOnPayload = turnOnParameter.as<std::string>();
+    hvac->setSetOnValue(turnOnPayload);
+  }
+  if (auto turnOffParameter =
+          getAndMarkChannelParameter(ch, "turn_off_payload")) {
+    auto turnOffPayload = turnOffParameter.as<std::string>();
+    hvac->setSetOffValue(turnOffPayload);
+  }
+  if (auto stateParameter =
+          getAndMarkChannelParameter(ch, Supla::Payload::HvacState)) {
+    if (payload->isBasedOnIndex()) {
+      int index = stateParameter.as<int>();
+      hvac->setMapping(Supla::Payload::HvacState, index);
+    } else {
+      std::string key = stateParameter.as<std::string>();
+      hvac->setMapping(Supla::Payload::HvacState, key);
+    }
+  }
+  if (auto mainThermometerParameter =
+          getAndMarkChannelParameter(ch, "main_thermometer_channel_no")) {
+    mainThermometerChannelNo = mainThermometerParameter.as<int>();
+  } else {
+    SUPLA_LOG_ERROR(
+        "Channel[%d] config: missing mandatory \"main_thermometer_channel_no\" "
+        "parameter",
+        channelNumber);
+    return false;
+  }
+  if (auto auxThermometerParameter =
+          getAndMarkChannelParameter(ch, "aux_thermometer_channel_no")) {
+    auxThermometerChannelNo = auxThermometerParameter.as<int>();
+  }
+
+  if (auto binarySensorParameter =
+          getAndMarkChannelParameter(ch, "binary_sensor_channel_no")) {
+    binarySensorChannelNo = binarySensorParameter.as<int>();
+  }
+
+  hvac->setMainThermometerChannelNo(mainThermometerChannelNo);
+  hvac->setAuxThermometerChannelNo(auxThermometerChannelNo);
+  if (binarySensorChannelNo >= 0) {
+    hvac->setBinarySensorChannelNo(binarySensorChannelNo);
+  }
+  hvac->setAuxThermometerType(SUPLA_HVAC_AUX_THERMOMETER_TYPE_NOT_SET);
+  if (hvac->getChannelNumber() != auxThermometerChannelNo) {
+    hvac->setAuxThermometerType(SUPLA_HVAC_AUX_THERMOMETER_TYPE_FLOOR);
+  }
+  hvac->setTemperatureHisteresisMin(20);        // 0.2 degree
+  hvac->setTemperatureHisteresisMax(1000);      // 10 degree
+  hvac->setTemperatureHeatCoolOffsetMin(200);   // 2 degrees
+  hvac->setTemperatureHeatCoolOffsetMax(1000);  // 10 degrees
+  hvac->setTemperatureAuxMin(500);              // 5 degrees
+  hvac->setTemperatureAuxMax(7500);             // 75 degrees
+  hvac->addAvailableAlgorithm(SUPLA_HVAC_ALGORITHM_ON_OFF_SETPOINT_MIDDLE);
+
+  hvac->setTemperatureHisteresis(40);
+
+  if (auto defaultFunctionParameter =
+          getAndMarkChannelParameter(ch, Supla::DefaultFunction)) {
+    std::string function = defaultFunctionParameter.as<std::string>();
+    if (function == "heat") {
+      hvac->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_HVAC_THERMOSTAT);
+      hvac->setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_HEAT);
+    } else if (function == "cool") {
+      hvac->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_HVAC_THERMOSTAT);
+      hvac->setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_COOL);
+    } else if (function == "heat_cool") {
+      hvac->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_HVAC_THERMOSTAT_HEAT_COOL);
+    } else if (function == "dhw") {
+      hvac->enableDomesticHotWaterFunctionSupport();
+      hvac->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_HVAC_DOMESTIC_HOT_WATER);
+    } else if (function == "diff") {
+      hvac->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_HVAC_THERMOSTAT_DIFFERENTIAL);
+    } else {
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown default function \"%s\"",
+                      channelNumber,
+                      function.c_str());
+      return false;
+    }
+  }
+  return addCommonParameters(ch, hvac);
+}
+
+bool Supla::LinuxYamlConfig::addThermometerParsed(
+    const YAML::Node& ch, int channelNumber, Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding ThremometerParsed", channelNumber);
+  auto therm = new Supla::Sensor::ThermometerParsed(parser);
+  therm->setRefreshIntervalMs(200);
+  if (auto temperatureParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Temperature)) {
+    if (parser->isBasedOnIndex()) {
+      int index = temperatureParameter.as<int>();
+      therm->setMapping(Supla::Parser::Temperature, index);
+    } else {
+      std::string key = temperatureParameter.as<std::string>();
+      therm->setMapping(Supla::Parser::Temperature, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Temperature);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    therm->setMultiplier(Supla::Parser::Temperature, multiplier);
+  } else if (auto multiplierParameter =
+                 getAndMarkChannelParameter(ch, Supla::MultiplierTemp)) {
+    double multiplier = multiplierParameter.as<double>();
+    therm->setMultiplier(Supla::Parser::Temperature, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, therm, parser);
+}
+
+bool Supla::LinuxYamlConfig::addGeneralPurposeMeasurementParsed(
+    const YAML::Node& ch, int channelNumber, Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding GeneralPurposeMeasurement",
+                 channelNumber);
+  auto gpm = new Supla::Sensor::GeneralPurposeMeasurementParsed(parser);
+  if (auto valueParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Value)) {
+    if (parser->isBasedOnIndex()) {
+      int index = valueParameter.as<int>();
+      gpm->setMapping(Supla::Parser::Value, index);
+    } else {
+      std::string key = valueParameter.as<std::string>();
+      gpm->setMapping(Supla::Parser::Value, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Value);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    gpm->setMultiplier(Supla::Parser::Value, multiplier);
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, "default_value_multiplier")) {
+    int64_t multiplier = std::lround(1000 * multiplierParameter.as<double>());
+    if (multiplier > INT32_MAX || multiplier < INT32_MIN) {
+      SUPLA_LOG_ERROR(
+          "Channel[%d] config: default_value_multiplier out of range",
+          channelNumber);
+      return false;
+    }
+    gpm->setDefaultValueMultiplier(multiplier);
+  }
+  if (auto dividerParameter =
+          getAndMarkChannelParameter(ch, "default_value_divider")) {
+    int64_t divider = std::lround(1000 * dividerParameter.as<double>());
+    if (divider > INT32_MAX || divider < INT32_MIN) {
+      SUPLA_LOG_ERROR("Channel[%d] config: default_value_divider out of range",
+                      channelNumber);
+      return false;
+    }
+    gpm->setDefaultValueDivider(divider);
+  }
+  if (auto addedParameter =
+          getAndMarkChannelParameter(ch, "default_value_added")) {
+    double added = addedParameter.as<double>();
+    gpm->setDefaultValueAdded(std::lround(added * 1000));
+  }
+  if (auto precisionParameter =
+          getAndMarkChannelParameter(ch, "default_value_precision")) {
+    int precision = precisionParameter.as<int>();
+    if (precision > 4 || precision < 0) {
+      SUPLA_LOG_ERROR(
+          "Channel[%d] config: default_value_precision out of range",
+          channelNumber);
+      return false;
+    }
+    gpm->setDefaultValuePrecision(precision);
+  }
+  if (auto unitParameter =
+          getAndMarkChannelParameter(ch, "default_unit_before_value")) {
+    std::string unit = unitParameter.as<std::string>();
+    if (unit.length() > 14) {
+      SUPLA_LOG_ERROR("Channel[%d] config: default_unit_before_value too long",
+                      channelNumber);
+      return false;
+    }
+    gpm->setDefaultUnitBeforeValue(unit.c_str());
+  }
+  if (auto unitParameter =
+          getAndMarkChannelParameter(ch, "default_unit_after_value")) {
+    std::string unit = unitParameter.as<std::string>();
+    if (unit.length() > 14) {
+      SUPLA_LOG_ERROR("Channel[%d] config: default_unit_after_value too long",
+                      channelNumber);
+      return false;
+    }
+    gpm->setDefaultUnitAfterValue(unit.c_str());
+  }
+
+  if (!addStateParser(ch, gpm, parser, false)) {
+    return false;
+  }
+
+  return addCommonParametersParsed(ch, gpm, parser);
+}
+
+bool Supla::LinuxYamlConfig::addGeneralPurposeMeterParsed(
+    const YAML::Node& ch, int channelNumber, Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding GeneralPurposeMeter",
+                 channelNumber);
+  auto gpm = new Supla::Sensor::GeneralPurposeMeterParsed(parser);
+  if (auto valueParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Value)) {
+    if (parser->isBasedOnIndex()) {
+      int index = valueParameter.as<int>();
+      gpm->setMapping(Supla::Parser::Value, index);
+    } else {
+      std::string key = valueParameter.as<std::string>();
+      gpm->setMapping(Supla::Parser::Value, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Value);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    gpm->setMultiplier(Supla::Parser::Value, multiplier);
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, "default_value_multiplier")) {
+    int64_t multiplier = std::lround(1000 * multiplierParameter.as<double>());
+    if (multiplier > INT32_MAX || multiplier < INT32_MIN) {
+      SUPLA_LOG_ERROR(
+          "Channel[%d] config: default_value_multiplier out of range",
+          channelNumber);
+      return false;
+    }
+    gpm->setDefaultValueMultiplier(multiplier);
+  }
+  if (auto dividerParameter =
+          getAndMarkChannelParameter(ch, "default_value_divider")) {
+    int64_t divider = std::lround(1000 * dividerParameter.as<double>());
+    if (divider > INT32_MAX || divider < INT32_MIN) {
+      SUPLA_LOG_ERROR("Channel[%d] config: default_value_divider out of range",
+                      channelNumber);
+      return false;
+    }
+    gpm->setDefaultValueDivider(divider);
+  }
+  if (auto addedParameter =
+          getAndMarkChannelParameter(ch, "default_value_added")) {
+    double added = addedParameter.as<double>();
+    gpm->setDefaultValueAdded(std::lround(added * 1000));
+  }
+  if (auto precisionParameter =
+          getAndMarkChannelParameter(ch, "default_value_precision")) {
+    int precision = precisionParameter.as<int>();
+    if (precision > 4 || precision < 0) {
+      SUPLA_LOG_ERROR(
+          "Channel[%d] config: default_value_precision out of range",
+          channelNumber);
+      return false;
+    }
+    gpm->setDefaultValuePrecision(precision);
+  }
+  if (auto unitParameter =
+          getAndMarkChannelParameter(ch, "default_unit_before_value")) {
+    std::string unit = unitParameter.as<std::string>();
+    if (unit.length() > 14) {
+      SUPLA_LOG_ERROR("Channel[%d] config: default_unit_before_value too long",
+                      channelNumber);
+      return false;
+    }
+    gpm->setDefaultUnitBeforeValue(unit.c_str());
+  }
+  if (auto unitParameter =
+          getAndMarkChannelParameter(ch, "default_unit_after_value")) {
+    std::string unit = unitParameter.as<std::string>();
+    if (unit.length() > 14) {
+      SUPLA_LOG_ERROR("Channel[%d] config: default_unit_after_value too long",
+                      channelNumber);
+      return false;
+    }
+    gpm->setDefaultUnitAfterValue(unit.c_str());
+  }
+
+  return addCommonParametersParsed(ch, gpm, parser);
+}
+
+bool Supla::LinuxYamlConfig::addImpulseCounterParsed(
+    const YAML::Node& ch, int channelNumber, Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding ImpulseCounterParsed",
+                 channelNumber);
+  auto ic = new Supla::Sensor::ImpulseCounterParsed(parser);
+  if (auto counterParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Counter)) {
+    if (parser->isBasedOnIndex()) {
+      int index = counterParameter.as<int>();
+      ic->setMapping(Supla::Parser::Counter, index);
+    } else {
+      std::string key = counterParameter.as<std::string>();
+      ic->setMapping(Supla::Parser::Counter, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Counter);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    ic->setMultiplier(Supla::Parser::Counter, multiplier);
+  }
+  if (auto impulsesParameter =
+          getAndMarkChannelParameter(ch, "default_impulses_per_unit")) {
+    auto impulsesPerUnit = impulsesParameter.as<uint32_t>();
+    if (impulsesPerUnit == 0) {
+      SUPLA_LOG_ERROR(
+          "Channel[%d] config: default_impulses_per_unit has to be > 0",
+          channelNumber);
+      return false;
+    }
+    ic->setDefaultImpulsesPerUnit(impulsesPerUnit);
+  }
+  if (auto defaultFunctionParameter =
+          getAndMarkChannelParameter(ch, Supla::DefaultFunction)) {
+    std::string function = defaultFunctionParameter.as<std::string>();
+    if (function == "electricity_meter" || function == "energy_meter") {
+      ic->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_IC_ELECTRICITY_METER);
+    } else if (function == "gas_meter") {
+      ic->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_IC_GAS_METER);
+    } else if (function == "water_meter") {
+      ic->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_IC_WATER_METER);
+    } else if (function == "heat_meter") {
+      ic->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_IC_HEAT_METER);
+    } else if (function == "events") {
+      ic->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_IC_EVENTS);
+    } else if (function == "seconds") {
+      ic->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_IC_SECONDS);
+    } else {
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown default function \"%s\"",
+                      channelNumber,
+                      function.c_str());
+      return false;
+    }
+  }
+  return addCommonParametersParsed(ch, ic, parser);
+}
+
+bool Supla::LinuxYamlConfig::addElectricityMeterParsed(
+    const YAML::Node& ch, int channelNumber, Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding ElectricityMeterParsed",
+                 channelNumber);
+  auto em = new Supla::Sensor::ElectricityMeterParsed(parser);
+
+  // set not phase releated parameters (currently only frequency)
+  if (auto frequencyParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Frequency)) {
+    if (parser->isBasedOnIndex()) {
+      int index = frequencyParameter.as<int>();
+      em->setMapping(Supla::Parser::Frequency, index);
+    } else {
+      std::string key = frequencyParameter.as<std::string>();
+      em->setMapping(Supla::Parser::Frequency, key);
+    }
+    if (auto multiplierParameter =
+            getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+      double multiplier = multiplierParameter.as<double>();
+      em->setMultiplier(Supla::Parser::Frequency, multiplier);
+    }
+  }
+
+  const std::map<std::string, int> phases = {
+      {"phase_1", 1}, {"phase_2", 2}, {"phase_3", 3}};
+
+  for (auto i : phases) {
+    if (auto phaseParameter = getAndMarkChannelParameter(ch, i.first.c_str())) {
+      auto phaseParameters = phaseParameter;
+      int phaseId = i.second;
+
+      for (auto param : phaseParameters) {
+        std::string paramName;
+        for (const char* name : {"voltage",
+                                 "current",
+                                 "fwd_act_energy",
+                                 "rvr_act_energy",
+                                 "fwd_react_energy",
+                                 "rvr_react_energy",
+                                 "power_active",
+                                 "rvr_power_active",
+                                 "power_reactive",
+                                 "power_apparent",
+                                 "phase_angle",
+                                 "power_factor"}) {
+          if (param[name]) {
+            paramName = std::string{name} + "_" +  // NOLINT(whitespace/braces)
+                        std::to_string(phaseId);
+            if (parser->isBasedOnIndex()) {
+              int index = param[name].as<int>();
+              em->setMapping(paramName, index);
+            } else {
+              std::string key = param[name].as<std::string>();
+              em->setMapping(paramName, key);
+            }
+            if (param[Supla::Multiplier]) {
+              double multiplier = param[Supla::Multiplier].as<double>();
+              em->setMultiplier(paramName, multiplier);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return addCommonParametersParsed(ch, em, parser);
+}
+
+bool Supla::LinuxYamlConfig::addBinaryParsed(const YAML::Node& ch,
+                                             int channelNumber,
+                                             Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding BinaryParsed", channelNumber);
+  auto binary = new Supla::Sensor::BinaryParsed(parser);
+
+  if (!addStateParser(ch, binary, parser, true)) {
+    return false;
+  }
+
+  if (!addActionTriggerActions(ch, binary, false)) {
+    return false;
+  }
+
+  if (auto defaultFunctionParameter =
+          getAndMarkChannelParameter(ch, Supla::DefaultFunction)) {
+    std::string function = defaultFunctionParameter.as<std::string>();
+    if (function == "no_liquid") {
+      binary->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_NOLIQUIDSENSOR);
+    } else if (function == "opening_door") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_OPENINGSENSOR_DOOR);
+    } else if (function == "opening_window") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_OPENINGSENSOR_WINDOW);
+    } else if (function == "hotel_card") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_HOTELCARDSENSOR);
+    } else if (function == "alarm_armament") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_ALARMARMAMENTSENSOR);
+    } else if (function == "mail") {
+      binary->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_MAILSENSOR);
+    } else if (function == "opening_roller_shutter") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_OPENINGSENSOR_ROLLERSHUTTER);
+    } else if (function == "opening_roof_window") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_OPENINGSENSOR_ROOFWINDOW);
+    } else if (function == "opening_garag_edoor") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_OPENINGSENSOR_GARAGEDOOR);
+    } else if (function == "opening_gate") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_OPENINGSENSOR_GATE);
+    } else if (function == "opening_gateway") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_OPENINGSENSOR_GATEWAY);
+    } else if (function == "container_level") {
+      binary->getChannel()->setDefaultFunction(
+          SUPLA_CHANNELFNC_CONTAINER_LEVEL_SENSOR);
+    } else if (function == "flood") {
+      binary->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_FLOOD_SENSOR);
+    } else if (function == "binary") {
+      binary->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_BINARY_SENSOR);
+    } else if (function == "motion") {
+      binary->getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_MOTION_SENSOR);
+    } else {
+      SUPLA_LOG_ERROR("Channel[%d] config: unknown default function \"%s\"",
+                      channelNumber,
+                      function.c_str());
+      return false;
+    }
+  }
+
+  if (auto timeoutParameter = getAndMarkChannelParameter(ch, "timeout_s")) {
+    double timeoutS = timeoutParameter.as<double>();
+    if (timeoutS < 0.0 || timeoutS > 3600.0) {
+      SUPLA_LOG_ERROR("Channel[%d] config: timeout_s out of range",
+                      channelNumber);
+      return false;
+    }
+    int64_t timeoutDs = std::lround(timeoutS * 10.0);
+    if (timeoutDs > 0) {
+      binary->setTimeoutDs(static_cast<uint16_t>(timeoutDs), false);
+    }
+  }
+
+  if (auto offlineParameter =
+          getAndMarkChannelParameter(ch, "offline_on_invalid_state")) {
+    auto useOfflineOnInvalidState = offlineParameter.as<bool>();
+    binary->setUseOfflineOnInvalidState(useOfflineOnInvalidState);
+  }
+
+  return addCommonParametersParsed(ch, binary, parser);
+}
+
+Supla::Source::Source* Supla::LinuxYamlConfig::findSource(
+    const std::string& name) {
+  if (sourceNames.count(name)) {
+    return sources[sourceNames[name]];
+  }
+  return nullptr;
+}
+
+Supla::Parser::Parser* Supla::LinuxYamlConfig::findParser(
+    const std::string& name) {
+  if (parserNames.count(name)) {
+    return parsers[parserNames[name]];
+  }
+  return nullptr;
+}
+
+Supla::Source::Source* Supla::LinuxYamlConfig::addSourceWithName(
+    const YAML::Node& source, const std::string& name) {
+  if (source["name"]) {
+    SUPLA_LOG_ERROR("Config: source \"%s\" can't define \"name\" parameter",
+                    name.c_str());
+    return nullptr;
+  }
+  if (source["use"]) {
+    SUPLA_LOG_ERROR("Config: source \"%s\" can't define \"use\" parameter",
+                    name.c_str());
+    return nullptr;
+  }
+  if (sourceNames.count(name)) {
+    SUPLA_LOG_ERROR("Config: duplicated source name \"%s\"", name.c_str());
+    return nullptr;
+  }
+
+  YAML::Node namedSource = YAML::Clone(source);
+  namedSource["name"] = name;
+  return addSource(namedSource);
+}
+
+Supla::Parser::Parser* Supla::LinuxYamlConfig::addParserWithName(
+    const YAML::Node& parser,
+    const std::string& name,
+    Supla::Source::Source* src) {
+  if (parser["name"]) {
+    SUPLA_LOG_ERROR("Config: parser \"%s\" can't define \"name\" parameter",
+                    name.c_str());
+    return nullptr;
+  }
+  if (parser["use"]) {
+    SUPLA_LOG_ERROR("Config: parser \"%s\" can't define \"use\" parameter",
+                    name.c_str());
+    return nullptr;
+  }
+  if (parserNames.count(name)) {
+    SUPLA_LOG_ERROR("Config: duplicated parser name \"%s\"", name.c_str());
+    return nullptr;
+  }
+
+  YAML::Node namedParser = YAML::Clone(parser);
+  namedParser["name"] = name;
+  return addParser(namedParser, src);
+}
+
+Supla::Parser::Parser* Supla::LinuxYamlConfig::addParser(
+    const YAML::Node& parser, Supla::Source::Source* src) {
+  Supla::Parser::Parser* prs = nullptr;
+  if (parser["use"]) {
+    std::string use = parser["use"].as<std::string>();
+    prs = findParser(use);
+    if (!prs) {
+      SUPLA_LOG_ERROR("Config: can't find parser with \"name\"=\"%s\"",
+                      use.c_str());
+      return nullptr;
+    }
+    if (parser["name"]) {
+      SUPLA_LOG_ERROR(
+          "Config: can't use \"name\" for parser with \"use\" parameter");
+      return nullptr;
+    }
+    return prs;
+  }
+
+  std::string name;
+  if (parser["name"]) {
+    name = parser["name"].as<std::string>();
+    if (parserNames.count(name)) {
+      SUPLA_LOG_ERROR("Config: duplicated parser name \"%s\"", name.c_str());
+      return nullptr;
+    }
+  }
+
+  if (!src) {
+    SUPLA_LOG_ERROR("Config: parser used without source");
+    return nullptr;
+  }
+
+  if (parser["type"]) {
+    std::string type = parser["type"].as<std::string>();
+    if (type == "Simple") {
+      prs = new Supla::Parser::Simple(src);
+    } else if (type == "Json") {
+      prs = new Supla::Parser::Json(src);
+    } else {
+      SUPLA_LOG_ERROR("Config: unknown parser type \"%s\"", type.c_str());
+      return nullptr;
+    }
+    if (parser["refresh_time_ms"]) {
+      int timeMs = parser["refresh_time_ms"].as<int>();
+      prs->setRefreshTime(timeMs);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Config: type not defined for parser");
+    return nullptr;
+  }
+
+  parsers[parserCount] = prs;
+  if (!name.empty()) {
+    parserNames[name] = parserCount;
+  }
+  parserCount++;
+  return prs;
+}
+
+Supla::Payload::Payload* Supla::LinuxYamlConfig::addPayload(
+    const YAML::Node& payload, Supla::Output::Output* out) {
+  Supla::Payload::Payload* tmpl = nullptr;
+  if (payload["use"]) {
+    auto use = payload["use"].as<std::string>();
+    if (payloadNames.count(use)) {
+      tmpl = payloads[payloadNames[use]];
+    }
+    if (!tmpl) {
+      SUPLA_LOG_ERROR("Config: can't find payload with \"name\"=\"%s\"",
+                      use.c_str());
+      return nullptr;
+    }
+    if (payload["name"]) {
+      SUPLA_LOG_ERROR(
+          "Config: can't use \"name\" for payload with \"use\" parameter");
+      return nullptr;
+    }
+    return tmpl;
+  }
+
+  if (payload["name"]) {
+    std::string name = payload["name"].as<std::string>();
+    payloadNames[name] = payloadCount;
+  }
+
+  if (!out) {
+    SUPLA_LOG_ERROR("Config: payload used without output");
+    return nullptr;
+  }
+
+  if (payload["type"]) {
+    std::string type = payload["type"].as<std::string>();
+    if (type == "Simple") {
+      tmpl = new Supla::Payload::Simple(out);
+    } else if (type == "Json") {
+      tmpl = new Supla::Payload::Json(out);
+    } else {
+      SUPLA_LOG_ERROR("Config: unknown payload type \"%s\"", type.c_str());
+      return nullptr;
+    }
+  } else {
+    SUPLA_LOG_ERROR("Config: type not defined for payload");
+    return nullptr;
+  }
+
+  payloads[payloadCount] = tmpl;
+  payloadCount++;
+  return tmpl;
+}
+
+Supla::Source::Source* Supla::LinuxYamlConfig::addSource(
+    const YAML::Node& source) {
+  Supla::Source::Source* src = nullptr;
+  if (source["qos"]) {
+    SUPLA_LOG_ERROR("Config: unrecognized parameter \"qos\" for source");
+    return nullptr;
+  }
+  if (source["use"]) {
+    std::string use = source["use"].as<std::string>();
+    src = findSource(use);
+    if (!src) {
+      SUPLA_LOG_ERROR("Config: can't find source with \"name\"=\"%s\"",
+                      use.c_str());
+      return nullptr;
+    }
+    if (source["name"]) {
+      SUPLA_LOG_ERROR(
+          "Config: can't use \"name\" for source with \"use\" parameter");
+      return nullptr;
+    }
+    return src;
+  }
+
+  std::string name;
+  if (source["name"]) {
+    name = source["name"].as<std::string>();
+    if (sourceNames.count(name)) {
+      SUPLA_LOG_ERROR("Config: duplicated source name \"%s\"", name.c_str());
+      return nullptr;
+    }
+  }
+
+  if (source["type"]) {
+    std::string type = source["type"].as<std::string>();
+    if (type == "File") {
+      std::string fileName = source["file"].as<std::string>();
+      int expirationTimeSec = 10 * 60;
+      if (source["expiration_time_sec"]) {
+        expirationTimeSec = source["expiration_time_sec"].as<int>();
+      }
+      src = new Supla::Source::File(fileName.c_str(), expirationTimeSec);
+    } else if (type == "Cmd") {
+      if (!source["command"]) {
+        SUPLA_LOG_ERROR("Config: 'command' not defined for 'Cmd' source");
+        return nullptr;
+      }
+      std::string cmd = source["command"].as<std::string>();
+      src = new Supla::Source::Cmd(cmd.c_str());
+    } else if (type == "MQTT") {
+      auto base_state_topic = source["state_topic"].as<std::string>();
+      std::vector<std::string> allSubTopics;
+      if (source["sub_topics"] && source["sub_topics"].size() > 0) {
+        auto sub_topics = source["sub_topics"].as<std::vector<std::string>>();
+        for (auto& sub_topic : sub_topics) {
+          std::string state_topic = base_state_topic;
+          state_topic.append("/").append(sub_topic);
+          allSubTopics.push_back(state_topic);
+        }
+      } else {
+        allSubTopics.push_back(base_state_topic);
+      }
+      src = new Supla::Source::Mqtt(*this, allSubTopics);
+    } else if (type == "HTTP") {
+#ifndef SUPLA_LINUX_HTTP_SOURCE_ENABLED
+      SUPLA_LOG_ERROR(
+          "Config: HTTP source support was not built. Install libcurl "
+          "development package and enable SUPLA_LINUX_ENABLE_HTTP_SOURCE.");
+      return nullptr;
+#else
+      if (!source["url"]) {
+        SUPLA_LOG_ERROR("Config: 'url' not defined for 'HTTP' source");
+        return nullptr;
+      }
+
+      std::string method = source["method"].as<std::string>("GET");
+      if (method != "GET") {
+        SUPLA_LOG_ERROR("Config: unsupported HTTP source method \"%s\"",
+                        method.c_str());
+        return nullptr;
+      }
+
+      std::string url = source["url"].as<std::string>();
+      if (url.empty()) {
+        SUPLA_LOG_ERROR("Config: empty 'url' for 'HTTP' source");
+        return nullptr;
+      }
+
+      std::map<std::string, std::string> headers;
+      if (source["headers"]) {
+        headers = source["headers"].as<std::map<std::string, std::string>>();
+      }
+
+      std::string authType = "none";
+      std::string tokenFile;
+      if (source["auth"]) {
+        authType = source["auth"]["type"].as<std::string>("none");
+        if (authType == "bearer_file") {
+          if (!source["auth"]["token_file"]) {
+            SUPLA_LOG_ERROR(
+                "Config: 'token_file' not defined for HTTP bearer_file auth");
+            return nullptr;
+          }
+          tokenFile = source["auth"]["token_file"].as<std::string>();
+          if (tokenFile.empty()) {
+            SUPLA_LOG_ERROR("Config: empty HTTP bearer token_file");
+            return nullptr;
+          }
+        } else if (authType != "none") {
+          SUPLA_LOG_ERROR("Config: unsupported HTTP auth type \"%s\"",
+                          authType.c_str());
+          return nullptr;
+        }
+      }
+
+      int refreshTimeMs = source["refresh_time_ms"].as<int>(30000);
+      if (refreshTimeMs < 10) {
+        SUPLA_LOG_ERROR("Config: HTTP refresh_time_ms has to be >= 10");
+        return nullptr;
+      }
+
+      int timeoutMs = source["timeout_ms"].as<int>(10000);
+      if (timeoutMs <= 0) {
+        SUPLA_LOG_ERROR("Config: HTTP timeout_ms has to be > 0");
+        return nullptr;
+      }
+
+      int expirationTimeSec = source["expiration_time_sec"].as<int>(10 * 60);
+      if (expirationTimeSec < 0) {
+        SUPLA_LOG_ERROR("Config: HTTP expiration_time_sec has to be >= 0");
+        return nullptr;
+      }
+
+      int maxBodySizeBytes = source["max_body_size_bytes"].as<int>(
+          Supla::Source::HTTP_SOURCE_DEFAULT_MAX_BODY_SIZE_BYTES);
+      if (maxBodySizeBytes <= 0) {
+        SUPLA_LOG_ERROR("Config: HTTP max_body_size_bytes has to be > 0");
+        return nullptr;
+      }
+
+      src =
+          new Supla::Source::Http(method,
+                                  url,
+                                  headers,
+                                  authType,
+                                  tokenFile,
+                                  static_cast<unsigned int>(refreshTimeMs),
+                                  static_cast<unsigned int>(timeoutMs),
+                                  static_cast<unsigned int>(expirationTimeSec),
+                                  static_cast<unsigned int>(maxBodySizeBytes));
+#endif
+    } else {
+      SUPLA_LOG_ERROR("Config: unknown source type \"%s\"", type.c_str());
+      return nullptr;
+    }
+
+  } else {
+    SUPLA_LOG_ERROR("Config: type not defined for source");
+    return nullptr;
+  }
+
+  sources[sourceCount] = src;
+  if (!name.empty()) {
+    sourceNames[name] = sourceCount;
+  }
+  sourceCount++;
+
+  return src;
+}
+
+Supla::Output::Output* Supla::LinuxYamlConfig::addOutput(
+    const YAML::Node& output) {
+  Supla::Output::Output* out = nullptr;
+  if (output["use"]) {
+    std::string use = output["use"].as<std::string>();
+    if (outputNames.count(use)) {
+      out = outputs[outputNames[use]];
+    }
+    if (!out) {
+      SUPLA_LOG_ERROR("Config: can't find output with \"name\"=\"%s\"",
+                      use.c_str());
+      return nullptr;
+    }
+    if (output["name"]) {
+      SUPLA_LOG_ERROR(
+          "Config: can't use \"name\" for output with \"use\" parameter");
+      return nullptr;
+    }
+    return out;
+  }
+
+  if (output["name"]) {
+    std::string name = output["name"].as<std::string>();
+    outputNames[name] = outputCount;
+  }
+
+  if (output["type"]) {
+    auto type = output["type"].as<std::string>();
+    if (type == "Cmd") {
+      if (!output["command"]) {
+        SUPLA_LOG_ERROR("Config: 'command' not defined for output");
+        return nullptr;
+      }
+      std::string cmd = output["command"].as<std::string>();
+      out = new Supla::Output::Cmd(cmd);
+    } else if (type == "File") {
+      std::string fileName = output["file"].as<std::string>();
+      out = new Supla::Output::File(fileName.c_str());
+    } else if (type == "MQTT") {
+      std::string controlTopic = output["control_topic"].as<std::string>();
+      int qos = output["qos"].as<int>(0);
+      if (qos < 0 || qos > 2) {
+        SUPLA_LOG_ERROR(
+            "Config: MQTT output qos has to be in range 0..2 (got %d)",
+            qos);
+        return nullptr;
+      }
+      out = new Supla::Output::Mqtt(*this, controlTopic.c_str(), qos);
+    } else {
+      SUPLA_LOG_ERROR("Config: unknown output type \"%s\"", type.c_str());
+      return nullptr;
+    }
+
+  } else {
+    SUPLA_LOG_ERROR("Config: type not defined for output");
+    return nullptr;
+  }
+
+  outputs[outputCount] = out;
+  outputCount++;
+
+  return out;
+}
+
+std::string Supla::LinuxYamlConfig::getStateFilesPath() {
+  std::string path;
+  try {
+    if (config["state_files_path"]) {
+      path = config["state_files_path"].as<std::string>();
+    }
+  } catch (const YAML::Exception& ex) {
+    logError(file, ex);
+  }
+  if (path.empty()) {
+    SUPLA_LOG_DEBUG("Config: missing state files path - using default");
+    path = "var/lib/supla-device";
+  }
+  return path;
+}
+
+void Supla::LinuxYamlConfig::loadGuidAuthFromPath(const std::string& path) {
+  try {
+    std::string file = path + Supla::GuidAuthFileName;
+    SUPLA_LOG_INFO("GUID and AUTHKEY: loading from file %s", file.c_str());
+    auto guidAuthYaml = YAML::LoadFile(file);
+    std::string guidHex;
+    std::string authHex;
+    if (guidAuthYaml[Supla::GuidKey]) {
+      guidHex = guidAuthYaml[Supla::GuidKey].as<std::string>();
+      if (guidHex.length() != SUPLA_GUID_HEXSIZE - 1) {
+        SUPLA_LOG_WARNING("GUID: invalid guid value length");
+        guidHex = "";
+      }
+      guid = guidHex;
+    } else {
+      SUPLA_LOG_WARNING("GUID: missing guid key in yaml file");
+    }
+    if (guidAuthYaml[Supla::AuthKeyKey]) {
+      authHex = guidAuthYaml[Supla::AuthKeyKey].as<std::string>();
+      if (authHex.length() != SUPLA_AUTHKEY_HEXSIZE - 1) {
+        SUPLA_LOG_WARNING("AUTHKEY: invalid authkey value length");
+        authHex = "";
+      }
+      authkey = authHex;
+    } else {
+      SUPLA_LOG_WARNING("AUTHKEY: missing authkey key in yaml file");
+    }
+  } catch (const YAML::Exception& ex) {
+    SUPLA_LOG_ERROR("Guid/auth file YAML error: %s", ex.what());
+  }
+}
+
+bool Supla::LinuxYamlConfig::saveGuidAuth(const std::string& path) {
+  if (!std::filesystem::exists(path)) {
+    std::error_code err;
+    if (!std::filesystem::create_directories(path, err)) {
+      SUPLA_LOG_WARNING("Config: failed to create folder for state files");
+      return false;
+    }
+  }
+  YAML::Node outputYaml;
+  outputYaml[Supla::GuidKey] = guid;
+  outputYaml[Supla::AuthKeyKey] = authkey;
+
+  std::ostringstream output;
+  output << outputYaml;
+  const std::string outputString = output.str();
+  const std::string filePath = path + Supla::GuidAuthFileName;
+  if (!Supla::Linux::writeSecureFile(
+          filePath, outputString.data(), outputString.size(), false)) {
+    SUPLA_LOG_ERROR("Config: failed to write guid/authkey to file");
+    return false;
+  }
+
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::isConfigModeSupported() {
+  return false;
+}
+
+bool Supla::LinuxYamlConfig::addThermHygroMeterParsed(
+    const YAML::Node& ch, int channelNumber, Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding ThermHygroMeterParsed",
+                 channelNumber);
+  auto thermHumi = new Supla::Sensor::ThermHygroMeterParsed(parser);
+  if (auto humidityParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Humidity)) {
+    if (parser->isBasedOnIndex()) {
+      int index = humidityParameter.as<int>();
+      thermHumi->setMapping(Supla::Parser::Humidity, index);
+    } else {
+      std::string key = humidityParameter.as<std::string>();
+      thermHumi->setMapping(Supla::Parser::Humidity, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Humidity);
+    return false;
+  }
+
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::MultiplierHumi)) {
+    double multiplier = multiplierParameter.as<double>();
+    thermHumi->setMultiplier(Supla::Parser::Humidity, multiplier);
+  }
+
+  if (auto temperatureParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Temperature)) {
+    if (parser->isBasedOnIndex()) {
+      int index = temperatureParameter.as<int>();
+      thermHumi->setMapping(Supla::Parser::Temperature, index);
+    } else {
+      std::string key = temperatureParameter.as<std::string>();
+      thermHumi->setMapping(Supla::Parser::Temperature, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Temperature);
+    return false;
+  }
+
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::MultiplierTemp)) {
+    double multiplier = multiplierParameter.as<double>();
+    thermHumi->setMultiplier(Supla::Parser::Temperature, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, thermHumi, parser);
+}
+
+bool Supla::LinuxYamlConfig::addHumidityParsed(const YAML::Node& ch,
+                                               int channelNumber,
+                                               Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding HumidityParsed", channelNumber);
+  auto humi = new Supla::Sensor::HumidityParsed(parser);
+  if (auto humidityParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Humidity)) {
+    if (parser->isBasedOnIndex()) {
+      int index = humidityParameter.as<int>();
+      humi->setMapping(Supla::Parser::Humidity, index);
+    } else {
+      std::string key = humidityParameter.as<std::string>();
+      humi->setMapping(Supla::Parser::Humidity, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Humidity);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    humi->setMultiplier(Supla::Parser::Humidity, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, humi, parser);
+}
+
+bool Supla::LinuxYamlConfig::addPressureParsed(const YAML::Node& ch,
+                                               int channelNumber,
+                                               Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding PressureParsed", channelNumber);
+  auto pressure = new Supla::Sensor::PressureParsed(parser);
+  if (auto pressureParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Pressure)) {
+    if (parser->isBasedOnIndex()) {
+      int index = pressureParameter.as<int>();
+      pressure->setMapping(Supla::Parser::Pressure, index);
+    } else {
+      std::string key = pressureParameter.as<std::string>();
+      pressure->setMapping(Supla::Parser::Pressure, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Pressure);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    pressure->setMultiplier(Supla::Parser::Pressure, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, pressure, parser);
+}
+
+bool Supla::LinuxYamlConfig::addWindParsed(const YAML::Node& ch,
+                                           int channelNumber,
+                                           Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding WindParsed", channelNumber);
+  auto wind = new Supla::Sensor::WindParsed(parser);
+  if (auto windParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Wind)) {
+    if (parser->isBasedOnIndex()) {
+      int index = windParameter.as<int>();
+      wind->setMapping(Supla::Parser::Wind, index);
+    } else {
+      std::string key = windParameter.as<std::string>();
+      wind->setMapping(Supla::Parser::Wind, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Wind);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    wind->setMultiplier(Supla::Parser::Wind, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, wind, parser);
+}
+
+bool Supla::LinuxYamlConfig::addRainParsed(const YAML::Node& ch,
+                                           int channelNumber,
+                                           Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding RainParsed", channelNumber);
+  auto rain = new Supla::Sensor::RainParsed(parser);
+  if (auto rainParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Rain)) {
+    if (parser->isBasedOnIndex()) {
+      int index = rainParameter.as<int>();
+      rain->setMapping(Supla::Parser::Rain, index);
+    } else {
+      std::string key = rainParameter.as<std::string>();
+      rain->setMapping(Supla::Parser::Rain, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Rain);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    rain->setMultiplier(Supla::Parser::Rain, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, rain, parser);
+}
+
+bool Supla::LinuxYamlConfig::addStateParser(
+    const YAML::Node& ch,
+    Supla::Sensor::SensorParsedBase* sensor,
+    Supla::Parser::Parser* parser,
+    bool mandatory) {
+  if (parser == nullptr && ch[Supla::Parser::State]) {
+    SUPLA_LOG_ERROR("Channel config: missing parser");
+    return false;
+  }
+
+  if (auto stateParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::State)) {
+    if (parser->isBasedOnIndex()) {
+      int index = stateParameter.as<int>();
+      sensor->setMapping(Supla::Parser::State, index);
+    } else {
+      std::string key = stateParameter.as<std::string>();
+      sensor->setMapping(Supla::Parser::State, key);
+    }
+    if (auto stateOnValuesParameter =
+            getAndMarkChannelParameter(ch, Supla::Parser::StateOnValues)) {
+      std::vector<std::variant<int, bool, std::string>> onValues;
+      for (const auto& val : stateOnValuesParameter) {
+        onValues.push_back(parseStateValue(val));
+      }
+      sensor->setOnValues(onValues);
+    }
+  } else {
+    if (mandatory) {
+      SUPLA_LOG_ERROR("Channel config: missing \"%s\" parameter",
+                      Supla::Parser::State);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::addStatePayload(
+    const YAML::Node& ch,
+    Supla::Payload::ControlPayloadBase* control,
+    Supla::Payload::Payload* payload,
+    bool mandatory) {
+  if (payload == nullptr && ch[Supla::Payload::State]) {
+    SUPLA_LOG_ERROR("Channel config: missing payload");
+    return false;
+  }
+
+  if (auto stateParameter =
+          getAndMarkChannelParameter(ch, Supla::Payload::State)) {
+    if (payload->isBasedOnIndex()) {
+      int index = stateParameter.as<int>();
+      control->setMapping(Supla::Payload::State, index);
+    } else {
+      auto key = stateParameter.as<std::string>();
+      control->setMapping(Supla::Payload::State, key);
+    }
+    if (auto turnOnParameter =
+            getAndMarkChannelParameter(ch, Supla::Payload::TurnOnPayload)) {
+      std::variant<int, bool, std::string> setOnValue;
+      YAML::Node node = turnOnParameter;
+
+      if (node.IsScalar()) {
+        auto value = node.as<std::string>();
+        try {
+          setOnValue = std::stoi(value);
+        } catch (const std::invalid_argument& e) {
+          if (value == "true") {
+            setOnValue = true;
+          } else if (value == "false") {
+            setOnValue = false;
+          } else {
+            setOnValue = value;
+          }
+        }
+      } else if (node.IsNull()) {
+        setOnValue = int();
+      }
+      control->setSetOnValue(setOnValue);
+    }
+    if (auto turnOffParameter =
+            getAndMarkChannelParameter(ch, Supla::Payload::TurnOffPayload)) {
+      std::variant<int, bool, std::string> setOffValue;
+      YAML::Node node = turnOffParameter;
+
+      if (node.IsScalar()) {
+        auto value = node.as<std::string>();
+        try {
+          setOffValue = std::stoi(value);
+        } catch (const std::invalid_argument& e) {
+          if (value == "true") {
+            setOffValue = true;
+          } else if (value == "false") {
+            setOffValue = false;
+          } else {
+            setOffValue = value;
+          }
+        }
+      } else if (node.IsNull()) {
+        setOffValue = int();
+      }
+      control->setSetOffValue(setOffValue);
+    }
+  } else {
+    if (mandatory) {
+      SUPLA_LOG_ERROR("Channel config: missing \"%s\" parameter",
+                      Supla::Payload::State);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::addActionTriggerActions(
+    const YAML::Node& ch,
+    Supla::Sensor::SensorParsedBase* sensor,
+    bool mandatory) {
+  if (mandatory && !ch[Supla::Parser::ActionTrigger]) {
+    SUPLA_LOG_ERROR("Channel config: mandatory \"%s\" parameter missing",
+                    Supla::Parser::ActionTrigger);
+    return false;
+  }
+
+  if (auto actionTriggerParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::ActionTrigger)) {
+    bool atNameFound = false;
+    for (const auto& el : actionTriggerParameter) {
+      if (el["on_state"]) {
+        if (!sensor->addAtOnState(el["on_state"].as<std::vector<int>>())) {
+          return false;
+        }
+      } else if (el["on_value"]) {
+        if (!sensor->addAtOnValue(el["on_value"].as<std::vector<int>>())) {
+          return false;
+        }
+      } else if (el["on_value_change"]) {
+        if (!sensor->addAtOnValueChange(
+                el["on_value_change"].as<std::vector<int>>())) {
+          return false;
+        }
+      } else if (el["on_state_change"]) {
+        if (!sensor->addAtOnStateChange(
+                el["on_state_change"].as<std::vector<int>>())) {
+          return false;
+        }
+      } else if (el["use"]) {
+        SUPLA_LOG_INFO("Channel config: using action trigger \"%s\"",
+                       el["use"].as<std::string>().c_str());
+        sensor->setAtName(el["use"].as<std::string>());
+        atNameFound = true;
+      }
+    }
+    if (!atNameFound) {
+      SUPLA_LOG_ERROR(
+          "Channel config: mandatory \"use\" parameter missing with "
+          "ActionTrigger name");
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::addActionTriggerParsed(const YAML::Node& ch,
+                                                    int channelNumber) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding ActionTriggerParsed",
+                 channelNumber);
+  if (auto nameParameter = getAndMarkChannelParameter(ch, "name")) {
+    auto name = nameParameter.as<std::string>();
+    auto at = new Supla::Control::ActionTriggerParsed(name);
+    return addCommonParameters(ch, at);
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: mandatory \"name\" parameter missing",
+                    channelNumber);
+    return false;
+  }
+}
+
+bool Supla::LinuxYamlConfig::addWeightParsed(const YAML::Node& ch,
+                                             int channelNumber,
+                                             Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding WeightParsed", channelNumber);
+  auto weight = new Supla::Sensor::WeightParsed(parser);
+  if (auto weightParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Weight)) {
+    if (parser->isBasedOnIndex()) {
+      int index = weightParameter.as<int>();
+      weight->setMapping(Supla::Parser::Weight, index);
+    } else {
+      std::string key = weightParameter.as<std::string>();
+      weight->setMapping(Supla::Parser::Weight, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Weight);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    weight->setMultiplier(Supla::Parser::Weight, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, weight, parser);
+}
+
+bool Supla::LinuxYamlConfig::addContainerParsed(const YAML::Node& ch,
+                                                int channelNumber,
+                                                Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding ContainerParsed", channelNumber);
+  auto container = new Supla::Sensor::ContainerParsed(parser);
+  if (auto levelParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Level)) {
+    if (parser->isBasedOnIndex()) {
+      int index = levelParameter.as<int>();
+      container->setMapping(Supla::Parser::Level, index);
+    } else {
+      std::string key = levelParameter.as<std::string>();
+      container->setMapping(Supla::Parser::Level, key);
+    }
+    container->setInternalLevelReporting(true);
+    if (auto multiplierParameter =
+            getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+      double multiplier = multiplierParameter.as<double>();
+      container->setMultiplier(Supla::Parser::Level, multiplier);
+    }
+  }
+  return addCommonParametersParsed(ch, container, parser);
+}
+
+bool Supla::LinuxYamlConfig::addCustomChannel(const YAML::Node& ch,
+                                              int channelNumber,
+                                              Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding CustomChannel", channelNumber);
+  auto custom = new Supla::CustomChannel(parser);
+  if (auto channelTypeParameter =
+          getAndMarkChannelParameter(ch, Supla::ChannelType)) {
+    uint32_t type = channelTypeParameter.as<uint32_t>();
+    custom->setChannelType(type);
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::ChannelType);
+    return false;
+  }
+
+  if (auto valueParameter = getAndMarkChannelParameter(ch, Supla::Value)) {
+    custom->setValue(valueParameter.as<std::string>());
+  }
+
+  return addCommonParametersParsed(ch, custom, parser);
+}
+
+bool Supla::LinuxYamlConfig::addDistanceParsed(const YAML::Node& ch,
+                                               int channelNumber,
+                                               Supla::Parser::Parser* parser) {
+  SUPLA_LOG_INFO("Channel[%d] config: adding DistanceParsed", channelNumber);
+  auto distance = new Supla::Sensor::DistanceParsed(parser);
+  if (auto distanceParameter =
+          getAndMarkChannelParameter(ch, Supla::Parser::Distance)) {
+    if (parser->isBasedOnIndex()) {
+      int index = distanceParameter.as<int>();
+      distance->setMapping(Supla::Parser::Distance, index);
+    } else {
+      std::string key = distanceParameter.as<std::string>();
+      distance->setMapping(Supla::Parser::Distance, key);
+    }
+  } else {
+    SUPLA_LOG_ERROR("Channel[%d] config: missing \"%s\" parameter",
+                    channelNumber,
+                    Supla::Parser::Distance);
+    return false;
+  }
+  if (auto multiplierParameter =
+          getAndMarkChannelParameter(ch, Supla::Multiplier)) {
+    double multiplier = multiplierParameter.as<double>();
+    distance->setMultiplier(Supla::Parser::Distance, multiplier);
+  }
+
+  return addCommonParametersParsed(ch, distance, parser);
+}
+
+bool Supla::LinuxYamlConfig::addCommonParametersParsed(
+    const YAML::Node& ch,
+    Supla::Sensor::SensorParsedBase* sensor,
+    Supla::Parser::Parser* parser) {
+  bool batteryAdded = false;
+  if (ch[Supla::Sensor::BatteryLevel]) {
+    if (parser == nullptr) {
+      SUPLA_LOG_ERROR(
+          "Channel config: missing \"parser\" parameter for battery_level");
+      return false;
+    }
+    batteryAdded = true;
+    auto batteryLevelParameter =
+        getAndMarkChannelParameter(ch, Supla::Sensor::BatteryLevel);
+    if (parser->isBasedOnIndex()) {
+      int index = batteryLevelParameter.as<int>();
+      sensor->setMapping(Supla::Sensor::BatteryLevel, index);
+    } else {
+      std::string key = batteryLevelParameter.as<std::string>();
+      sensor->setMapping(Supla::Sensor::BatteryLevel, key);
+    }
+  }
+  if (auto multiplierParameter = getAndMarkChannelParameter(
+          ch, Supla::Sensor::MultiplierBatteryLevel)) {
+    double multiplier = multiplierParameter.as<double>();
+    sensor->setMultiplier(Supla::Sensor::BatteryLevel, multiplier);
+  }
+  if (ch[Supla::Sensor::BatteryPowered]) {
+    if (parser == nullptr) {
+      SUPLA_LOG_ERROR(
+          "Channel config: missing \"parser\" parameter for battery_powered");
+      return false;
+    }
+    batteryAdded = true;
+    auto batteryPoweredParameter =
+        getAndMarkChannelParameter(ch, Supla::Sensor::BatteryPowered);
+    if (parser->isBasedOnIndex()) {
+      int index = batteryPoweredParameter.as<int>();
+      sensor->setMapping(Supla::Sensor::BatteryPowered, index);
+    } else {
+      std::string key = batteryPoweredParameter.as<std::string>();
+      sensor->setMapping(Supla::Sensor::BatteryPowered, key);
+    }
+  }
+  if (ch[Supla::Sensor::BatteryState]) {
+    if (parser == nullptr) {
+      SUPLA_LOG_ERROR(
+          "Channel config: missing \"parser\" parameter for battery_state");
+      return false;
+    }
+    batteryAdded = true;
+    auto batteryStateParameter =
+        getAndMarkChannelParameter(ch, Supla::Sensor::BatteryState);
+    if (parser->isBasedOnIndex()) {
+      int index = batteryStateParameter.as<int>();
+      sensor->setMapping(Supla::Sensor::BatteryState, index);
+    } else {
+      std::string key = batteryStateParameter.as<std::string>();
+      sensor->setMapping(Supla::Sensor::BatteryState, key);
+    }
+  }
+  if (auto applyToWholeDeviceParameter = getAndMarkChannelParameter(
+          ch, Supla::Sensor::BatteryStateAppliesToWholeDevice)) {
+    sensor->setBatteryStateAppliesToWholeDevice(
+        applyToWholeDeviceParameter.as<bool>());
+  }
+  if (auto forceBatteryPoweredParameter =
+          getAndMarkChannelParameter(ch, Supla::Sensor::ForceBatteryPowered)) {
+    auto forceBatteryPowered = forceBatteryPoweredParameter.as<bool>();
+    if (forceBatteryPowered) {
+      batteryAdded = true;
+    }
+    sensor->setForceBatteryPowered(forceBatteryPowered);
+  }
+  if (auto initialCaptionParameter =
+          getAndMarkChannelParameter(ch, Supla::InitialCaption)) {
+    sensor->setInitialCaption(
+        initialCaptionParameter.as<std::string>().c_str());
+  }
+  if (auto channelNumberParameter =
+          getAndMarkChannelParameter(ch, "channel_number")) {  // optional
+    int channelNumber = channelNumberParameter.as<int>();
+    if (channelNumber < 0 || channelNumber >= SUPLA_CHANNELMAXCOUNT) {
+      SUPLA_LOG_ERROR(
+          "Channel config: channel_number has to be in range 0..%d",
+          SUPLA_CHANNELMAXCOUNT - 1);
+      return false;
+    }
+    auto ch = sensor->getChannel();
+    if (ch) {
+      if (ch->getChannelNumber() != channelNumber &&
+          !Supla::RegisterDevice::isChannelNumberFree(channelNumber)) {
+        SUPLA_LOG_ERROR("Channel config: channel_number %d is already in use",
+                        channelNumber);
+        return false;
+      }
+      if (!ch->setChannelNumber(channelNumber)) {
+        SUPLA_LOG_ERROR("Failed to set channel number: %d", channelNumber);
+        return false;
+      }
+    }
+  }
+  if (auto iconIdParameter =
+          getAndMarkChannelParameter(ch, "icon_id")) {  // optional
+    int iconId = iconIdParameter.as<int>();
+    if (iconId < 0 || iconId > 255) {
+      SUPLA_LOG_ERROR(
+          "Channel config: icon_id has to be in range 0..255");
+      return false;
+    }
+    auto ch = sensor->getChannel();
+    if (ch) {
+      ch->setDefaultIcon(static_cast<uint8_t>(iconId));
+    }
+  }
+  if (batteryAdded) {
+    sensor->updateBatteryInfoFlags();
+  }
+  return addDefaultFunctionNumber(
+      ch, dynamic_cast<Supla::Element*>(sensor));
+}
+
+bool Supla::LinuxYamlConfig::addCommonParameters(const YAML::Node& ch,
+                                                 Supla::Element* element) {
+  if (auto initialCaptionParameter =
+          getAndMarkChannelParameter(ch, Supla::InitialCaption)) {
+    element->setInitialCaption(
+        initialCaptionParameter.as<std::string>().c_str());
+  }
+  if (auto channelNumberParameter =
+          getAndMarkChannelParameter(ch, "channel_number")) {  // optional
+    int channelNumber = channelNumberParameter.as<int>();
+    if (channelNumber < 0 || channelNumber >= SUPLA_CHANNELMAXCOUNT) {
+      SUPLA_LOG_ERROR(
+          "Channel config: channel_number has to be in range 0..%d",
+          SUPLA_CHANNELMAXCOUNT - 1);
+      return false;
+    }
+    auto ch = element->getChannel();
+    if (ch) {
+      if (ch->getChannelNumber() != channelNumber &&
+          !Supla::RegisterDevice::isChannelNumberFree(channelNumber)) {
+        SUPLA_LOG_ERROR("Channel config: channel_number %d is already in use",
+                        channelNumber);
+        return false;
+      }
+      if (!ch->setChannelNumber(channelNumber)) {
+        SUPLA_LOG_ERROR("Failed to set channel number: %d", channelNumber);
+        return false;
+      }
+    }
+  }
+  if (auto iconIdParameter =
+          getAndMarkChannelParameter(ch, "icon_id")) {  // optional
+    int iconId = iconIdParameter.as<int>();
+    if (iconId < 0 || iconId > 255) {
+      SUPLA_LOG_ERROR(
+          "Channel config: icon_id has to be in range 0..255");
+      return false;
+    }
+    auto ch = element->getChannel();
+    if (ch) {
+      ch->setDefaultIcon(static_cast<uint8_t>(iconId));
+    }
+  }
+  return addDefaultFunctionNumber(ch, element);
+}
+
+bool Supla::LinuxYamlConfig::addDefaultFunctionNumber(
+    const YAML::Node& ch, Supla::Element* element) {
+  if (auto parameter =
+          getAndMarkChannelParameter(ch, Supla::DefaultFunctionNumber)) {
+    if (element == nullptr || element->getChannel() == nullptr) {
+      SUPLA_LOG_ERROR(
+          "Channel config: default_function_number requires a channel");
+      return false;
+    }
+    int32_t functionNumber = parameter.as<int32_t>();
+    element->setRuntimeFunction(functionNumber);
+  }
+  return true;
+}
+
+bool Supla::LinuxYamlConfig::addRelayDefaultFunction(
+    const YAML::Node& ch, Supla::Control::Relay* relay) {
+  auto parameter = getAndMarkChannelParameter(ch, Supla::DefaultFunction);
+  if (!parameter) {
+    return true;
+  }
+
+  struct RelayFunction {
+    const char* name;
+    uint32_t function;
+  };
+  static constexpr RelayFunction relayFunctions[] = {
+      {"gateway_lock", SUPLA_CHANNELFNC_CONTROLLINGTHEGATEWAYLOCK},
+      {"gate", SUPLA_CHANNELFNC_CONTROLLINGTHEGATE},
+      {"garage_door", SUPLA_CHANNELFNC_CONTROLLINGTHEGARAGEDOOR},
+      {"door_lock", SUPLA_CHANNELFNC_CONTROLLINGTHEDOORLOCK},
+      {"power_switch", SUPLA_CHANNELFNC_POWERSWITCH},
+      {"light_switch", SUPLA_CHANNELFNC_LIGHTSWITCH},
+      {"staircase_timer", SUPLA_CHANNELFNC_STAIRCASETIMER},
+  };
+
+  std::string function = parameter.as<std::string>();
+  for (const auto& item : relayFunctions) {
+    if (function == item.name) {
+      relay->setRuntimeFunction(item.function);
+      return true;
+    }
+  }
+
+  SUPLA_LOG_ERROR("Channel[%d] config: unknown relay default function \"%s\"",
+                  relay->getChannelNumber(),
+                  function.c_str());
+  return false;
+}
+
+std::variant<int, bool, std::string> Supla::LinuxYamlConfig::parseStateValue(
+    const YAML::Node& node) {
+  if (node.Type() == YAML::NodeType::Scalar) {
+    try {
+      return node.as<int>();
+    } catch (...) {
+      std::string strVal = node.Scalar();
+      if (strVal == "true" || strVal == "false")
+        return node.as<bool>();
+      else
+        return strVal;
+    }
+  }
+  return 0;
+}

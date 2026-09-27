@@ -1,0 +1,72 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/**
+ * @supla-example
+ * @file Fronius.ino
+ * @brief Example of connecting a Fronius inverter to SUPLA using an ESP8266/ESP32.
+ * This example configures an ESP device with Wi-Fi to communicate with a Fronius photovoltaic inverter
+ * and integrate its data with the SUPLA cloud. It includes a web server for Wi-Fi and SUPLA server configuration.
+ * Network settings are configured via the web interface.
+ * Users still need to adjust the Fronius inverter's IP address in the code.
+ * A status LED is also configured.
+ *
+ * @tags fronius, inverter, photovoltaic, esp, esp32, esp8266, wifi, pv, energy, web_interface
+ */
+#include <SuplaDevice.h>
+#include <supla/device/status_led.h>
+#include <supla/network/esp_web_server.h>
+#include <supla/network/esp_wifi.h>
+#include <supla/network/html/device_info.h>
+#include <supla/network/html/protocol_parameters.h>
+#include <supla/network/html/status_led_parameters.h>
+#include <supla/network/html/wifi_parameters.h>
+#include <supla/pv/fronius.h>
+#include <supla/storage/littlefs_config.h>
+
+#define STATUS_LED_GPIO 2
+
+Supla::ESPWifi wifi;
+Supla::LittleFsConfig configSupla;
+
+Supla::Device::StatusLed statusLed(STATUS_LED_GPIO, true);  // inverted state
+Supla::EspWebServer suplaServer;
+
+void setup() {
+  Serial.begin(115200);
+
+  // HTML www component
+  new Supla::Html::DeviceInfo(&SuplaDevice);
+  new Supla::Html::WifiParameters;
+  new Supla::Html::ProtocolParameters;
+  new Supla::Html::StatusLedParameters;
+
+  /*
+   * Parameters in order:
+   * - IP address of your Fronius DataManager card,
+   * - port (deafult is 80),
+   * - device ID (for inverters: SolarNet inverter id, usually starts with 1,
+   * for meters starts with 0)
+   * - device type: 0 - single phase inverter, 1 - three phase inverter,
+   * 2 - three phase meter
+   * 
+   * Uncomment one or multiple lines according to your installation
+   * Each line is a new CHANNEL
+   */
+  // Single phase inverter
+  new Supla::PV::Fronius(IPAddress(192, 168, 0, 59), 80, 1, 0);
+  // Three phase inverter
+  //new Supla::PV::Fronius(IPAddress(192, 168, 0, 59), 80, 1, 1);
+  // Three phase inverter with id = 2
+  // (can be also a second one connected to same DataManager card)
+  //new Supla::PV::Fronius(IPAddress(192, 168, 0, 59), 80, 2, 1);
+  // Three phase Smart Meter
+  //new Supla::PV::Fronius(IPAddress(192, 168, 0, 59), 80, 0, 2);
+
+  SuplaDevice.setInitialMode(Supla::InitialMode::StartInCfgMode);
+  SuplaDevice.begin();
+}
+
+void loop() {
+  SuplaDevice.iterate();
+}

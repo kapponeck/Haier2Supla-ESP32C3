@@ -1,0 +1,149 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <arduino_mock.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+#include <simple_time.h>
+#include <supla/control/rgb_leds.h>
+#include <supla_io_mock.h>
+
+#include "legacy_pwm_test_io.h"
+
+using ::testing::Return;
+
+class TimeInterfaceStub : public TimeInterface {
+ public:
+  uint32_t millis() override {
+    static uint32_t value = 0;
+    value += 1000;
+    return value;
+  }
+};
+
+TEST(RgbLedsTests, SettingNewRGBValue) {
+  Supla::Channel::resetToDefaults();
+  SimpleTime time;
+  DigitalInterfaceMock ioMock;
+
+  EXPECT_CALL(ioMock, analogWriteResolution(1, 10)).Times(1);
+  EXPECT_CALL(ioMock, analogWriteFrequency(1, 1000)).Times(1);
+  EXPECT_CALL(ioMock, analogWriteResolution(2, 10)).Times(1);
+  EXPECT_CALL(ioMock, analogWriteFrequency(2, 1000)).Times(1);
+  EXPECT_CALL(ioMock, analogWriteResolution(3, 10)).Times(1);
+  EXPECT_CALL(ioMock, analogWriteFrequency(3, 1000)).Times(1);
+  EXPECT_CALL(ioMock, pinMode(1, OUTPUT));
+  EXPECT_CALL(ioMock, pinMode(2, OUTPUT));
+  EXPECT_CALL(ioMock, pinMode(3, OUTPUT));
+  EXPECT_CALL(ioMock, analogWrite(1, 0));
+  EXPECT_CALL(ioMock, analogWrite(2, 0));
+  EXPECT_CALL(ioMock, analogWrite(3, 0));
+
+  EXPECT_CALL(ioMock, analogWrite(1, (1 * 1023 / 255)));
+  EXPECT_CALL(ioMock, analogWrite(2, (2 * 1023 / 255)));
+  EXPECT_CALL(ioMock, analogWrite(3, (3 * 1023 / 255)));
+
+  Supla::Control::RGBLeds rgb(1, 2, 3);
+
+  auto ch = rgb.getChannel();
+  // disable fading effect so we'll get instant setting value on device call
+  rgb.setFadeEffectTime(0);
+
+  EXPECT_EQ(ch->getValueRed(), 0);
+  EXPECT_EQ(ch->getValueGreen(), 0);
+  EXPECT_EQ(ch->getValueBlue(), 0);
+  EXPECT_EQ(ch->getValueColorBrightness(), 0);
+  EXPECT_EQ(ch->getValueBrightness(), 0);
+
+  time.advance(1000);
+  rgb.onInit();
+  time.advance(1);
+  rgb.onFastTimer();
+  time.advance(1);
+  rgb.onFastTimer();
+
+  EXPECT_EQ(ch->getValueRed(), 0);
+  EXPECT_EQ(ch->getValueGreen(), 0);
+  EXPECT_EQ(ch->getValueBlue(), 0);
+  EXPECT_EQ(ch->getValueColorBrightness(), 0);
+  EXPECT_EQ(ch->getValueBrightness(), 0);
+
+  time.advance(1000);
+  rgb.iterateAlways();
+
+  EXPECT_EQ(ch->getValueRed(), 0);
+  EXPECT_EQ(ch->getValueGreen(), 255);
+  EXPECT_EQ(ch->getValueBlue(), 0);
+  EXPECT_EQ(ch->getValueColorBrightness(), 0);
+  EXPECT_EQ(ch->getValueBrightness(), 0);
+
+  rgb.setRGBW(1, 2, 3, 100, 5);
+
+  time.advance(1000);
+  rgb.iterateAlways();
+  time.advance(1000);
+  rgb.onFastTimer();
+
+  EXPECT_EQ(ch->getValueRed(), 1);
+  EXPECT_EQ(ch->getValueGreen(), 2);
+  EXPECT_EQ(ch->getValueBlue(), 3);
+  EXPECT_EQ(ch->getValueColorBrightness(), 100);
+  EXPECT_EQ(ch->getValueBrightness(), 0);
+}
+
+TEST(RgbLedsTests, IoPinConstructorUsesSeparateIoForOutputs) {
+  Supla::Channel::resetToDefaults();
+  SimpleTime time;
+  SuplaIoMock redIo;
+  SuplaIoMock greenIo;
+  SuplaIoMock blueIo;
+
+  EXPECT_CALL(redIo, customSetPwmResolutionBits(11, 10));
+  EXPECT_CALL(redIo, customSetPwmFrequency(1000));
+  EXPECT_CALL(greenIo, customSetPwmResolutionBits(12, 10));
+  EXPECT_CALL(greenIo, customSetPwmFrequency(1000));
+  EXPECT_CALL(blueIo, customSetPwmResolutionBits(13, 10));
+  EXPECT_CALL(blueIo, customSetPwmFrequency(1000));
+  EXPECT_CALL(redIo, customConfigureAnalogOutput(-1, 11, false));
+  EXPECT_CALL(greenIo, customConfigureAnalogOutput(-1, 12, false));
+  EXPECT_CALL(blueIo, customConfigureAnalogOutput(-1, 13, false));
+  EXPECT_CALL(redIo, customPinMode(-1, 11, OUTPUT));
+  EXPECT_CALL(greenIo, customPinMode(-1, 12, OUTPUT));
+  EXPECT_CALL(blueIo, customPinMode(-1, 13, OUTPUT));
+
+  EXPECT_CALL(redIo, customAnalogWrite(-1, 11, 1));
+  EXPECT_CALL(greenIo, customAnalogWrite(-1, 12, 2));
+  EXPECT_CALL(blueIo, customAnalogWrite(-1, 13, 3));
+
+  Supla::Control::RGBLeds rgb(Supla::Io::IoPin(11, &redIo),
+                              Supla::Io::IoPin(12, &greenIo),
+                              Supla::Io::IoPin(13, &blueIo));
+
+  auto ch = rgb.getChannel();
+  rgb.setFadeEffectTime(0);
+
+  time.advance(1000);
+  rgb.onInit();
+  rgb.setRGBWValueOnDevice(1, 2, 3, 0);
+
+  EXPECT_EQ(ch->getValueRed(), 0);
+  EXPECT_EQ(ch->getValueGreen(), 0);
+  EXPECT_EQ(ch->getValueBlue(), 0);
+  EXPECT_EQ(ch->getValueColorBrightness(), 0);
+  EXPECT_EQ(ch->getValueBrightness(), 0);
+}
+
+TEST(RgbLedsTests, ScalesEveryChannelForFixedEightBitOutputs) {
+  FixedEightBitPwmIo redIo;
+  FixedEightBitPwmIo greenIo;
+  FixedEightBitPwmIo blueIo;
+  Supla::Control::RGBLeds rgb(Supla::Io::IoPin(1, &redIo),
+                              Supla::Io::IoPin(2, &greenIo),
+                              Supla::Io::IoPin(3, &blueIo));
+
+  rgb.setRGBWValueOnDevice(511, 767, 1023, 0);
+
+  EXPECT_THAT(redIo.values, ::testing::ElementsAre(127));
+  EXPECT_THAT(greenIo.values, ::testing::ElementsAre(191));
+  EXPECT_THAT(blueIo.values, ::testing::ElementsAre(255));
+}

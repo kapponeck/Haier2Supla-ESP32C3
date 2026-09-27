@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/**
+ * @supla-example
+ * @file RGBW.ino
+ * @brief Example of controlling RGBW LEDs with a button using an Arduino Mega for SUPLA integration.
+ * This example demonstrates how to control the color and brightness of RGBW LEDs (Red, Green, Blue, White)
+ * using a momentary button connected to an Arduino Mega. The button can be used to toggle the LEDs
+ * and iterate through brightness levels.
+ * The device integrates with the SUPLA cloud via an Ethernet shield (W5100 or ENC28J60).
+ * Users need to adjust network settings, SUPLA GUID, AUTHKEY, and GPIO pins for the RGBW channels and the button in the code.
+ *
+ * @tags RGBW, LED, dimmer, color, brightness, button, arduino_mega, ethernet, w5100, enc28j60
+ */
+#include <SuplaDevice.h>
+#include <supla/control/rgbw_leds.h>
+#include <supla/control/button.h>
+
+// Choose proper network interface for your card:
+// Arduino Mega with EthernetShield W5100:
+#include <supla/network/ethernet_shield.h>
+// Ethernet MAC address
+uint8_t mac[6] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
+Supla::EthernetShield ethernet(mac);
+
+// Arduino Mega with ENC28J60:
+// #include <supla/network/ENC28J60.h>
+// Supla::ENC28J60 ethernet(mac);
+
+/*
+ * Youtube: https://youtu.be/FE9tqzTjmA4
+ * Youtube example was done on older version of SuplaDevice library
+ */
+
+#define RED_PIN              4
+#define GREEN_PIN            5
+#define BLUE_PIN             12
+#define BRIGHTNESS_PIN       13
+#define BUTTON_PIN           0
+
+void setup() {
+  Serial.begin(115200);
+
+  // Replace the falowing GUID with value that you can retrieve from
+  // https://www.supla.org/arduino/get-guid
+  char GUID[SUPLA_GUID_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+  // Replace the following AUTHKEY with value that you can retrieve from:
+  // https://www.supla.org/arduino/get-authkey
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00};
+
+  /*
+   * Having your device already registered at cloud.supla.org,
+   * you want to change CHANNEL sequence or remove any of them,
+   * then you must also remove the device itself from cloud.supla.org.
+   * Otherwise you will get "Channel conflict!" error.
+   */
+
+  // CHANNEL0 - RGB controller and dimmer (RGBW)
+  auto rgbw = new Supla::Control::RGBWLeds(
+      RED_PIN, GREEN_PIN, BLUE_PIN, BRIGHTNESS_PIN);
+
+  auto button = new Supla::Control::Button(BUTTON_PIN, true, true);
+  button->setMulticlickTime(200);
+  button->setHoldTime(400);
+  button->repeatOnHoldEvery(35);
+
+  rgbw->setStep(1);
+  // rgbw->setMinMaxIterationDelay(750);  // delay between dimming direction
+  // change, 750 ms (default)
+  // rgbw->setMinIterationBrightness(1);  // 1 is default value
+
+  button->addAction(Supla::ITERATE_DIM_ALL, rgbw, Supla::ON_HOLD);
+  button->addAction(Supla::TOGGLE, rgbw, Supla::ON_CLICK_1);
+
+  /*
+   * SuplaDevice Initialization.
+   * Server address is available at https://cloud.supla.org
+   * If you do not have an account, you can create it at
+   * https://cloud.supla.org/account/create SUPLA and SUPLA CLOUD are free of
+   * charge
+   *
+   */
+
+  SuplaDevice.begin(
+      GUID,              // Global Unique Identifier
+      "svr1.supla.org",  // SUPLA server address
+      "email@address",   // Email address used to login to Supla Cloud
+      AUTHKEY);          // Authorization key
+}
+
+void loop() {
+  SuplaDevice.iterate();
+}

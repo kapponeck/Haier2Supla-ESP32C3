@@ -1,0 +1,616 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <config_mock.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+#include <supla/control/valve_base.h>
+#include <supla/control/virtual_valve.h>
+#include <supla/storage/storage.h>
+#include <simple_time.h>
+#include <arduino_mock.h>
+#include <supla/events.h>
+
+#include <cstring>
+
+#include "supla/sensor/virtual_binary.h"
+
+using ::testing::AtLeast;
+using ::testing::_;
+using ::testing::Invoke;
+using ::testing::NiceMock;
+using ::testing::StrEq;
+
+class ActionHandlerMock : public Supla::ActionHandler {
+ public:
+  MOCK_METHOD(void, handleAction, (int, int), (override));
+};
+
+TEST(ValveTests, LoadConfigUsesInternalValveConfigSize) {
+  NiceMock<ConfigMock> config;
+  Supla::Storage::SetConfigInstance(&config);
+  Supla::Channel::resetToDefaults();
+  Supla::Control::ValveBase valve;
+
+  EXPECT_CALL(config, getBlob(StrEq("0_valve_cfg"), _,
+                              sizeof(Supla::Control::ValveConfig)))
+      .Times(1)
+      .WillOnce(Invoke([](const char *, char *blob, size_t blobSize) {
+        Supla::Control::ValveConfig storedConfig = {};
+        storedConfig.sensorData[0] = 3;
+        storedConfig.closeValveOnFloodType = 2;
+        EXPECT_EQ(blobSize, sizeof(storedConfig));
+        std::memcpy(blob, &storedConfig, sizeof(storedConfig));
+        return true;
+      }));
+
+  valve.onLoadConfig(nullptr);
+
+  TChannelConfig_Valve channelConfig = {};
+  int configSize = 0;
+  valve.fillChannelConfig(&channelConfig, &configSize,
+                          SUPLA_CONFIG_TYPE_DEFAULT);
+
+  EXPECT_EQ(configSize, sizeof(TChannelConfig_Valve));
+  EXPECT_EQ(channelConfig.SensorInfo[0].IsSet, 1);
+  EXPECT_EQ(channelConfig.SensorInfo[0].ChannelNo, 3);
+  EXPECT_EQ(channelConfig.CloseValveOnFloodType, 2);
+
+  Supla::Storage::SetConfigInstance(nullptr);
+}
+
+
+TEST(ValveTests, ValveOpenCloseChannelMethods) {
+  Supla::Channel::resetToDefaults();
+  SimpleTime time;
+  Supla::Control::ValveBase valve;
+
+  auto channel = valve.getChannel();
+  EXPECT_EQ(channel->getChannelType(), SUPLA_CHANNELTYPE_VALVE_OPENCLOSE);
+  EXPECT_EQ(channel->getDefaultFunction(), SUPLA_CHANNELFNC_VALVE_OPENCLOSE);
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveOpenState(0);
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  channel->setValveOpenState(1);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(50);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(100);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(101);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveFloodingFlag(true);
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveManuallyClosedFlag(true);
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveFloodingFlag(false);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+  channel->setValveManuallyClosedFlag(false);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveManuallyClosedFlag(true);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveFloodingFlag(true);
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveOpenState(0);
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  channel->setValveOpenState(1);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(50);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(100);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(101);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+}
+
+TEST(ValveTests, ValvePercentageChannelMethods) {
+  Supla::Channel::resetToDefaults();
+  SimpleTime time;
+  Supla::Control::ValveBase valve(false);
+
+  auto channel = valve.getChannel();
+  EXPECT_EQ(channel->getChannelType(), SUPLA_CHANNELTYPE_VALVE_PERCENTAGE);
+  EXPECT_EQ(channel->getDefaultFunction(), SUPLA_CHANNELFNC_VALVE_PERCENTAGE);
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+    channel->setValveOpenState(0);
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  channel->setValveOpenState(1);
+  EXPECT_EQ(channel->getValveOpenState(), 1);
+  channel->setValveOpenState(50);
+  EXPECT_EQ(channel->getValveOpenState(), 50);
+  channel->setValveOpenState(100);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(101);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveFloodingFlag(true);
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveManuallyClosedFlag(true);
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveFloodingFlag(false);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveManuallyClosedFlag(false);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveManuallyClosedFlag(true);
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveFloodingFlag(true);
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  channel->setValveOpenState(0);
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  channel->setValveOpenState(1);
+  EXPECT_EQ(channel->getValveOpenState(), 1);
+  channel->setValveOpenState(50);
+  EXPECT_EQ(channel->getValveOpenState(), 50);
+  channel->setValveOpenState(100);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  channel->setValveOpenState(101);
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+}
+
+TEST(ValveTests, ValveElementTests) {
+  Supla::Channel::resetToDefaults();
+  SimpleTime time;
+  Supla::Control::VirtualValve valve;
+  Supla::Sensor::VirtualBinary vb1;
+  Supla::Sensor::VirtualBinary vb2;
+
+  auto channel = valve.getChannel();
+  EXPECT_EQ(channel->getChannelType(), SUPLA_CHANNELTYPE_VALVE_OPENCLOSE);
+  EXPECT_EQ(channel->getDefaultFunction(), SUPLA_CHANNELFNC_VALVE_OPENCLOSE);
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+
+  valve.onLoadConfig(nullptr);
+  valve.onLoadState();
+  valve.onInit();
+  vb1.onLoadConfig(nullptr);
+  vb1.onLoadState();
+  vb1.onInit();
+  vb2.onLoadConfig(nullptr);
+  vb2.onLoadState();
+  vb2.onInit();
+
+  vb1.clear();
+  vb2.clear();
+
+  // load state defaults valve open state to "0"
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+
+  valve.setValueOnDevice(0);
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  valve.setValueOnDevice(10);
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // check manually closed flag
+  valve.setValueOnDevice(0);
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  TSD_SuplaChannelNewValue newValueFromServer = {};
+  newValueFromServer.DurationMS = 0;
+  newValueFromServer.ChannelNumber = valve.getChannelNumber();
+  newValueFromServer.value[0] = 1;  // open
+
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  newValueFromServer.value[0] = 0;  // Close
+
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  newValueFromServer.value[0] = 1;  // open
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+
+  valve.setValueOnDevice(10);
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  valve.setValueOnDevice(0);
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_TRUE(channel->isValveManuallyClosedFlagActive());
+
+  // move time by 40s to clear ignoring of manually closed flag check after
+  // request from server - by default it is set to 30s.
+  for (int i = 0; i < 4; i++) {
+    time.advance(10000);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  valve.setValueOnDevice(100);
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // Check flooding flag
+  newValueFromServer.value[0] = 1;  // open
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  valve.addSensor(vb1.getChannelNumber());
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // Flood detected
+  vb1.set();
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // try to open, when flood detection is active
+  newValueFromServer.value[0] = 1;  // open
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  vb1.clear();
+  // no more flood detection, but flag remains
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // open clears flag
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // add vb2
+  vb2.set();
+  valve.addSensor(vb2.getChannelNumber());
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+}
+
+TEST(ValveTests, ValveOnChangeTests) {
+  Supla::Channel::resetToDefaults();
+  SimpleTime time;
+  Supla::Control::VirtualValve valve;
+  valve.setDefaultCloseValveOnFloodType(
+      SUPLA_VALVE_CLOSE_ON_FLOOD_TYPE_ON_CHANGE);
+  Supla::Sensor::VirtualBinary vb1;
+  Supla::Sensor::VirtualBinary vb2;
+
+  auto channel = valve.getChannel();
+  EXPECT_EQ(channel->getChannelType(), SUPLA_CHANNELTYPE_VALVE_OPENCLOSE);
+  EXPECT_EQ(channel->getDefaultFunction(), SUPLA_CHANNELFNC_VALVE_OPENCLOSE);
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+
+  valve.onLoadConfig(nullptr);
+  valve.onLoadState();
+  valve.onInit();
+  vb1.onLoadConfig(nullptr);
+  vb1.onLoadState();
+  vb1.onInit();
+  vb2.onLoadConfig(nullptr);
+  vb2.onLoadState();
+  vb2.onInit();
+
+  vb1.clear();
+  vb2.clear();
+
+  // load state defaults valve open state to "0"
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+
+  valve.setValueOnDevice(100);
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  valve.addSensor(vb1.getChannelNumber());
+  valve.addSensor(vb2.getChannelNumber());
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // Flood detected
+  vb1.set();
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  // try to open, when flood detection is active
+  TSD_SuplaChannelNewValue newValueFromServer = {};
+  newValueFromServer.DurationMS = 0;
+  newValueFromServer.ChannelNumber = valve.getChannelNumber();
+  newValueFromServer.value[0] = 1;  // open
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  // it should be open, becuase we only close on flooding state change
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  vb2.set();
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  vb1.clear();
+  vb2.clear();
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 0);
+  EXPECT_FALSE(channel->isValveOpen());
+  EXPECT_TRUE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+
+  EXPECT_EQ(1, valve.handleNewValueFromServer(&newValueFromServer));
+  for (int i = 0; i < 10; i++) {
+    time.advance(200);
+    valve.iterateAlways();
+    vb1.iterateAlways();
+    vb2.iterateAlways();
+  }
+
+  EXPECT_EQ(channel->getValveOpenState(), 100);
+  EXPECT_TRUE(channel->isValveOpen());
+  EXPECT_FALSE(channel->isValveFloodingFlagActive());
+  EXPECT_FALSE(channel->isValveManuallyClosedFlagActive());
+}

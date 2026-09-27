@@ -1,0 +1,75 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/**
+ * @supla-example
+ * @file DHT.ino
+ * @brief Example of connecting multiple DHT (DHT22) temperature and humidity sensors to SUPLA using an Arduino Mega.
+ * This example configures the Arduino Mega with an Ethernet shield (W5100 or ENC28J60)
+ * to read data from two DHT22 sensors and integrate it with the SUPLA cloud.
+ * Users need to adjust network settings, SUPLA GUID, AUTHKEY, and the GPIO pin numbers for the DHT sensors in the code.
+ *
+ * @dependency https://github.com/adafruit/DHT-sensor-library
+ * @tags DHT, DHT22, temperature, humidity, sensor, arduino_mega, ethernet, w5100, enc28j60
+ */
+
+#include <SuplaDevice.h>
+#include <supla/sensor/DHT.h>
+
+// Choose proper network interface for your card:
+// Arduino Mega with EthernetShield W5100:
+#include <supla/network/ethernet_shield.h>
+// Ethernet MAC address
+uint8_t mac[6] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
+Supla::EthernetShield ethernet(mac);
+
+// Arduino Mega with ENC28J60:
+// #include <supla/network/ENC28J60.h>
+// Supla::ENC28J60 ethernet(mac);
+
+#define DHT1PIN 24
+#define DHT1TYPE DHT22
+#define DHT2PIN 25
+#define DHT2TYPE DHT22
+
+void setup() {
+  Serial.begin(115200);
+
+  // Replace the falowing GUID with value that you can retrieve from
+  // https://www.supla.org/arduino/get-guid
+  char GUID[SUPLA_GUID_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+  // Replace the following AUTHKEY with value that you can retrieve from:
+  // https://www.supla.org/arduino/get-authkey
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00};
+
+  // This example adds two DHT22 sensors:
+
+  // CHANNEL0 - DHT22 Sensor
+  new Supla::Sensor::DHT(DHT1PIN, DHT1TYPE);
+
+  // CHANNEL1 - DHT22 Sensor
+  new Supla::Sensor::DHT(DHT2PIN, DHT2TYPE);
+
+  /*
+   * SuplaDevice Initialization.
+   * Server address is available at https://cloud.supla.org
+   * If you do not have an account, you can create it at
+   * https://cloud.supla.org/account/create SUPLA and SUPLA CLOUD are free of
+   * charge
+   */
+
+  SuplaDevice.begin(
+      GUID,              // Global Unique Identifier
+      "svr1.supla.org",  // SUPLA server address
+      "email@address",   // Email address used to login to Supla Cloud
+      AUTHKEY);          // Authorization key
+}
+
+void loop() {
+  SuplaDevice.iterate();
+}
+

@@ -1,0 +1,92 @@
+// SPDX-FileCopyrightText: AC SOFTWARE SP. Z O.O.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/**
+ * @supla-example
+ * @file HX711_Weight_sensor.ino
+ * @brief Example of connecting an HX711 weight sensor to SUPLA with an Arduino Mega.
+ * This example demonstrates how to integrate an HX711 load cell amplifier with a weight sensor
+ * to an Arduino Mega, providing weight measurements to the SUPLA cloud via an Ethernet shield (W5100 or ENC28J60).
+ * It includes functionality for taring the scales using an external button.
+ * Users need to adjust network settings, SUPLA GUID, AUTHKEY, and GPIO pins for the HX711 module and the button in the code.
+ *
+ * @dependency https://github.com/olkal/HX711_ADC
+ * @tags HX711, weight, load_cell, sensor, scales, tare, button, arduino_mega, ethernet, w5100, enc28j60
+ */
+
+#include <SuplaDevice.h>
+#include <supla/sensor/HX711.h>
+#include <supla/control/button.h>
+
+#define SDA_GPIO 21
+#define SCL_GPIO 22
+#define BUTTON_GPIO 4
+
+// Choose where Supla should store HX711 configuration data in persistent memory
+// We recommend to use external FRAM memory
+// #define FRAM_CS_PIN TBD // choose a free GPIO and replace TBD
+// #define STORAGE_OFFSET 100
+// #include <supla/storage/fram_spi.h>
+// Supla::FramSpi fram(FRAM_CS_PIN, STORAGE_OFFSET);
+#include <supla/storage/eeprom.h>
+Supla::Eeprom eeprom;
+
+// Choose proper network interface for your card:
+// Arduino Mega with EthernetShield W5100:
+#include <supla/network/ethernet_shield.h>
+// Ethernet MAC address
+uint8_t mac[6] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
+Supla::EthernetShield ethernet(mac);
+
+// Arduino Mega with ENC28J60:
+// #include <supla/network/ENC28J60.h>
+// Supla::ENC28J60 ethernet(mac);
+
+void setup() {
+  Serial.begin(115200);
+
+  // Replace the falowing GUID with value that you can retrieve from
+  // https://www.supla.org/arduino/get-guid
+  char GUID[SUPLA_GUID_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+  // Replace the following AUTHKEY with value that you can retrieve from:
+  // https://www.supla.org/arduino/get-authkey
+  char AUTHKEY[SUPLA_AUTHKEY_SIZE] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                      0x00, 0x00};
+
+  /*
+   * Having your device already registered at cloud.supla.org,
+   * you want to change CHANNEL sequence or remove any of them,
+   * then you must also remove the device itself from cloud.supla.org.
+   * Otherwise you will get "Channel conflict!" error.
+   */
+
+  auto scales = new Supla::Sensor::HX711(SDA_GPIO, SCL_GPIO);
+  // Optionally, enter the calibration value as the third parameter (SDA_GPIO,
+  // SCL_GPIO, 696.0)
+  auto button = new Supla::Control::Button(BUTTON_GPIO);
+  button->setSwNoiseFilterDelay(50);
+  button->addAction(Supla::TARE_SCALES, scales, Supla::ON_PRESS);
+
+  /*
+   * SuplaDevice Initialization.
+   * Server address is available at https://cloud.supla.org
+   * If you do not have an account, you can create it at
+   * https://cloud.supla.org/account/create SUPLA and SUPLA CLOUD are free of
+   * charge
+   *
+   */
+
+  SuplaDevice.begin(
+      GUID,              // Global Unique Identifier
+      "svr1.supla.org",  // SUPLA server address
+      "email@address",   // Email address used to login to Supla Cloud
+      AUTHKEY);          // Authorization key
+}
+
+void loop() {
+  SuplaDevice.iterate();
+}
+
